@@ -1,15 +1,20 @@
-// Phase 3: Integrity Verification System
-// 무결성 검증 시스템 (향후 구현)
+// Phase 2: Integrity Verification Module
 
-// 계획:
-// - Real-time Integrity Monitoring
-// - Checksum-based Verification
-// - Merkle Tree Root Validation
+pub mod integrity_checker;
+
+pub use integrity_checker::{
+    IntegrityChecker, IntegrityReport, IntegrityStatus,
+    ChunkStatus, ConsistencySnapshot, IntegrityStats,
+};
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn test_phase_3_placeholder() {
-        // Phase 3 구현 예정
+    fn test_integrity_module_exports() {
+        let checker = IntegrityChecker::new();
+        let stats = checker.integrity_stats();
+        assert_eq!(stats.total_checks, 0);
     }
 }

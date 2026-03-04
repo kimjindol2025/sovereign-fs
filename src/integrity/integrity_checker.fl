@@ -1,0 +1,322 @@
+// Phase 2: Integrity Verification System
+// 실시간 무결성 검증 및 일관성 스냅샷
+
+use crate::cas::*;
+use std::collections::HashMap;
+
+/// 무결성 검사 결과
+#[derive(Clone, Debug, PartialEq)]
+pub enum IntegrityStatus {
+    Valid,              // 유효함
+    Corrupted,          // 손상됨
+    Missing,            // 청크 누락
+    Modified,           // 변조됨
+    Unknown,            // 미확인
+}
+
+/// 파일 무결성 보고서
+#[derive(Clone, Debug)]
+pub struct IntegrityReport {
+    pub filename: String,
+    pub status: IntegrityStatus,
+    pub original_hash: String,
+    pub computed_hash: String,
+    pub checked_at: u64,
+    pub chunk_status: Vec<ChunkStatus>,
+}
+
+/// 청크 상태
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkStatus {
+    pub index: usize,
+    pub hash: String,
+    pub status: IntegrityStatus,
+}
+
+/// 일관성 스냅샷 (특정 시점의 전체 시스템 상태)
+#[derive(Clone, Debug)]
+pub struct ConsistencySnapshot {
+    pub timestamp: u64,
+    pub total_files: usize,
+    pub valid_files: usize,
+    pub corrupted_files: usize,
+    pub file_reports: Vec<IntegrityReport>,
+    pub overall_health: f64,  // 0.0 ~ 1.0 (1.0 = 완벽)
+}
+
+/// 무결성 검증 엔진
+pub struct IntegrityChecker {
+    // 파일명 → 최근 검증 보고서
+    last_reports: HashMap<String, IntegrityReport>,
+    // 스냅샷 이력
+    snapshots: Vec<ConsistencySnapshot>,
+    total_checks: usize,
+    total_corruptions_detected: usize,
+}
+
+impl IntegrityChecker {
+    pub fn new() -> Self {
+        IntegrityChecker {
+            last_reports: HashMap::new(),
+            snapshots: Vec::new(),
+            total_checks: 0,
+            total_corruptions_detected: 0,
+        }
+    }
+
+    /// 파일 무결성 검증
+    pub fn verify_file(&mut self, filename: &str, manifest: &FileManifest, store: &ChunkStore) -> IntegrityReport {
+        self.total_checks += 1;
+        let mut reconstructed = Vec::new();
+        let mut chunk_statuses = Vec::new();
+        let mut all_valid = true;
+
+        // 모든 청크 검증
+        for (idx, chunk_hash) in manifest.chunk_hashes.iter().enumerate() {
+            let chunk_opt = store.get_chunk(chunk_hash);
+
+            if let Some(chunk) = chunk_opt {
+                // 청크 존재: 유효함
+                reconstructed.extend_from_slice(&chunk);
+                chunk_statuses.push(ChunkStatus {
+                    index: idx,
+                    hash: chunk_hash.to_hex(),
+                    status: IntegrityStatus::Valid,
+                });
+            } else {
+                // 청크 누락
+                all_valid = false;
+                chunk_statuses.push(ChunkStatus {
+                    index: idx,
+                    hash: chunk_hash.to_hex(),
+                    status: IntegrityStatus::Missing,
+                });
+            }
+        }
+
+        // 파일 크기 조정
+        reconstructed.truncate(manifest.file_size);
+
+        // 파일 해시 재계산
+        let engine = HashEngine::new();
+        let computed_hash = engine.sha256(&reconstructed);
+        let original_hash = &manifest.file_hash;
+
+        // 무결성 판정
+        let status = if !all_valid {
+            IntegrityStatus::Missing
+        } else if computed_hash == *original_hash {
+            IntegrityStatus::Valid
+        } else {
+            IntegrityStatus::Modified
+        };
+
+        if status != IntegrityStatus::Valid {
+            self.total_corruptions_detected += 1;
+        }
+
+        let report = IntegrityReport {
+            filename: filename.to_string(),
+            status: status.clone(),
+            original_hash: original_hash.to_hex(),
+            computed_hash: computed_hash.to_hex(),
+            checked_at: self.current_timestamp(),
+            chunk_status: chunk_statuses,
+        };
+
+        self.last_reports.insert(filename.to_string(), report.clone());
+        report
+    }
+
+    /// 특정 파일의 최근 보고서 조회
+    pub fn get_last_report(&self, filename: &str) -> Option<IntegrityReport> {
+        self.last_reports.get(filename).cloned()
+    }
+
+    /// 일관성 스냅샷 생성
+    pub fn create_snapshot(&mut self, manifests: &HashMap<String, FileManifest>, store: &ChunkStore) -> ConsistencySnapshot {
+        let total_files = manifests.len();
+        let mut valid_count = 0;
+        let mut corrupted_count = 0;
+        let mut reports = Vec::new();
+
+        for (filename, manifest) in manifests {
+            let report = self.verify_file(filename, manifest, store);
+
+            match report.status {
+                IntegrityStatus::Valid => valid_count += 1,
+                _ => corrupted_count += 1,
+            }
+
+            reports.push(report);
+        }
+
+        let overall_health = if total_files > 0 {
+            valid_count as f64 / total_files as f64
+        } else {
+            1.0
+        };
+
+        let snapshot = ConsistencySnapshot {
+            timestamp: self.current_timestamp(),
+            total_files,
+            valid_files: valid_count,
+            corrupted_files: corrupted_count,
+            file_reports: reports,
+            overall_health,
+        };
+
+        self.snapshots.push(snapshot.clone());
+        snapshot
+    }
+
+    /// 스냅샷 이력 조회
+    pub fn get_snapshots(&self) -> &[ConsistencySnapshot] {
+        &self.snapshots
+    }
+
+    /// 최근 스냅샷
+    pub fn latest_snapshot(&self) -> Option<ConsistencySnapshot> {
+        self.snapshots.last().cloned()
+    }
+
+    /// 시스템 건강도 추이
+    pub fn health_trend(&self) -> Vec<(u64, f64)> {
+        self.snapshots
+            .iter()
+            .map(|s| (s.timestamp, s.overall_health))
+            .collect()
+    }
+
+    /// 무결성 통계
+    pub fn integrity_stats(&self) -> IntegrityStats {
+        let total_checks = self.total_checks;
+        let total_corruptions = self.total_corruptions_detected;
+
+        let corruption_rate = if total_checks > 0 {
+            total_corruptions as f64 / total_checks as f64
+        } else {
+            0.0
+        };
+
+        IntegrityStats {
+            total_checks,
+            corruptions_found: total_corruptions,
+            corruption_rate,
+            snapshots_taken: self.snapshots.len(),
+        }
+    }
+
+    #[inline]
+    fn current_timestamp(&self) -> u64 {
+        self.total_checks as u64
+    }
+}
+
+/// 무결성 통계
+#[derive(Clone, Debug)]
+pub struct IntegrityStats {
+    pub total_checks: usize,
+    pub corruptions_found: usize,
+    pub corruption_rate: f64,
+    pub snapshots_taken: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_integrity_checker_creation() {
+        let checker = IntegrityChecker::new();
+        assert_eq!(checker.total_checks, 0);
+    }
+
+    #[test]
+    fn test_integrity_status_enum() {
+        assert_eq!(IntegrityStatus::Valid, IntegrityStatus::Valid);
+        assert_ne!(IntegrityStatus::Valid, IntegrityStatus::Corrupted);
+    }
+
+    #[test]
+    fn test_verify_valid_file() {
+        let mut checker = IntegrityChecker::new();
+        let engine = HashEngine::new();
+        let data = b"Test data";
+
+        let mut store = ChunkStore::new();
+        store.store_chunked(data);
+
+        let manifest = FileManifest {
+            file_hash: engine.sha256(data),
+            chunk_hashes: vec![engine.sha256(data)],
+            file_size: data.len(),
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        let report = checker.verify_file("test.txt", &manifest, &store);
+        assert_eq!(report.status, IntegrityStatus::Valid);
+    }
+
+    #[test]
+    fn test_integrity_report() {
+        let report = IntegrityReport {
+            filename: "test.txt".to_string(),
+            status: IntegrityStatus::Valid,
+            original_hash: "abc123".to_string(),
+            computed_hash: "abc123".to_string(),
+            checked_at: 1,
+            chunk_status: vec![],
+        };
+
+        assert_eq!(report.status, IntegrityStatus::Valid);
+    }
+
+    #[test]
+    fn test_snapshot_creation() {
+        let mut checker = IntegrityChecker::new();
+        let engine = HashEngine::new();
+        let data = b"Snapshot test";
+
+        let mut store = ChunkStore::new();
+        store.store_chunked(data);
+
+        let mut manifests = HashMap::new();
+        let manifest = FileManifest {
+            file_hash: engine.sha256(data),
+            chunk_hashes: vec![engine.sha256(data)],
+            file_size: data.len(),
+            stored_timestamp: 1,
+            immutable: true,
+        };
+        manifests.insert("test.txt".to_string(), manifest);
+
+        let snapshot = checker.create_snapshot(&manifests, &store);
+        assert!(snapshot.total_files > 0);
+    }
+
+    #[test]
+    fn test_health_trend() {
+        let mut checker = IntegrityChecker::new();
+        let engine = HashEngine::new();
+        let data = b"Trend test";
+
+        let mut store = ChunkStore::new();
+        store.store_chunked(data);
+
+        let mut manifests = HashMap::new();
+        let manifest = FileManifest {
+            file_hash: engine.sha256(data),
+            chunk_hashes: vec![engine.sha256(data)],
+            file_size: data.len(),
+            stored_timestamp: 1,
+            immutable: true,
+        };
+        manifests.insert("test.txt".to_string(), manifest);
+
+        checker.create_snapshot(&manifests, &store);
+        let trend = checker.health_trend();
+        assert!(!trend.is_empty());
+    }
+}

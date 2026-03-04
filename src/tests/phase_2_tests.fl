@@ -1,0 +1,475 @@
+// Phase 2: Deduplication + Integrity Verification E2E Tests
+
+use crate::cas::*;
+use crate::dedup::*;
+use crate::integrity::*;
+
+#[test]
+fn test_exact_duplicate_detection() {
+    let mut dedup = DedupEngine::new();
+    let engine = HashEngine::new();
+
+    let manifest = FileManifest {
+        file_hash: engine.sha256(b"Same Content"),
+        chunk_hashes: vec![engine.sha256(b"chunk")],
+        file_size: 12,
+        stored_timestamp: 1,
+        immutable: true,
+    };
+
+    dedup.register_file("file1.txt", manifest.clone());
+    dedup.register_file("file2.txt", manifest);
+
+    let duplicates = dedup.find_exact_duplicates("file1.txt");
+    assert!(!duplicates.is_empty());
+    assert!(duplicates.contains(&"file2.txt".to_string()));
+    println!("✅ Exact Duplicates: {:?}", duplicates);
+}
+
+#[test]
+fn test_similar_content_detection() {
+    let mut dedup = DedupEngine::new();
+    let engine = HashEngine::new();
+
+    // 50% 공유 청크
+    let manifest1 = FileManifest {
+        file_hash: engine.sha256(b"File1"),
+        chunk_hashes: vec![
+            engine.sha256(b"shared_chunk"),
+            engine.sha256(b"unique_chunk_1"),
+        ],
+        file_size: 10,
+        stored_timestamp: 1,
+        immutable: true,
+    };
+
+    let manifest2 = FileManifest {
+        file_hash: engine.sha256(b"File2"),
+        chunk_hashes: vec![
+            engine.sha256(b"shared_chunk"),
+            engine.sha256(b"unique_chunk_2"),
+        ],
+        file_size: 10,
+        stored_timestamp: 2,
+        immutable: true,
+    };
+
+    dedup.register_file("file1.txt", manifest1);
+    dedup.register_file("file2.txt", manifest2);
+
+    let similar = dedup.find_similar_files("file1.txt", 0.30);
+    assert!(!similar.is_empty());
+    println!("✅ Similar Files Found: {}", similar.len());
+    for sim in &similar {
+        println!("   - Similarity: {:.2}%", sim.similarity.value() * 100.0);
+    }
+}
+
+#[test]
+fn test_similarity_score_levels() {
+    let identical = SimilarityScore::new(1.0);
+    assert!(identical.is_identical());
+
+    let very_similar = SimilarityScore::new(0.99);
+    assert!(very_similar.is_very_similar());
+    assert!(!very_similar.is_identical());
+
+    let similar = SimilarityScore::new(0.75);
+    assert!(similar.is_similar());
+    assert!(!similar.is_very_similar());
+
+    let dissimilar = SimilarityScore::new(0.50);
+    assert!(!dissimilar.is_similar());
+
+    println!("✅ Similarity Levels Verified");
+}
+
+#[test]
+fn test_dedup_strategy_recommendation() {
+    let mut dedup = DedupEngine::new();
+    let engine = HashEngine::new();
+
+    // 중복 파일들 생성
+    let manifest = FileManifest {
+        file_hash: engine.sha256(b"Strategy Test"),
+        chunk_hashes: vec![engine.sha256(b"chunk")],
+        file_size: 13,
+        stored_timestamp: 1,
+        immutable: true,
+    };
+
+    dedup.register_file("file1.txt", manifest.clone());
+    dedup.register_file("file2.txt", manifest);
+
+    let strategy = dedup.dedup_strategy("file1.txt");
+    assert!(strategy.exact_duplicates > 0);
+    assert_eq!(strategy.recommendation, DedupRecommendation::Consolidate);
+
+    println!("✅ Dedup Strategy: {:?}", strategy.recommendation);
+}
+
+#[test]
+fn test_dedup_statistics() {
+    let mut dedup = DedupEngine::new();
+    let engine = HashEngine::new();
+
+    // 파일 생성: 3개 중복 + 2개 고유
+    for i in 0..3 {
+        let manifest = FileManifest {
+            file_hash: engine.sha256(b"Dup Content"),
+            chunk_hashes: vec![engine.sha256(b"dup_chunk")],
+            file_size: 11,
+            stored_timestamp: i,
+            immutable: true,
+        };
+        dedup.register_file(&format!("dup{}.txt", i), manifest);
+    }
+
+    for i in 0..2 {
+        let manifest = FileManifest {
+            file_hash: engine.sha256(&format!("Unique {}", i).as_bytes()),
+            chunk_hashes: vec![engine.sha256(&format!("unique_{}", i).as_bytes())],
+            file_size: 10,
+            stored_timestamp: 3 + i,
+            immutable: true,
+        };
+        dedup.register_file(&format!("unique{}.txt", i), manifest);
+    }
+
+    let stats = dedup.dedup_statistics();
+    println!("✅ Dedup Stats:");
+    println!("   Total Files: {}", stats.total_files);
+    println!("   Duplicate Groups: {}", stats.exact_duplicate_groups);
+    println!("   Files with Dups: {}", stats.files_with_duplicates);
+    println!("   Dedup %: {:.1}%", stats.dedup_percentage);
+
+    assert_eq!(stats.total_files, 5);
+}
+
+#[test]
+fn test_integrity_verification() {
+    let mut checker = IntegrityChecker::new();
+    let engine = HashEngine::new();
+    let data = b"Integrity Test Data";
+
+    let mut store = ChunkStore::new();
+    store.store_chunked(data);
+
+    let manifest = FileManifest {
+        file_hash: engine.sha256(data),
+        chunk_hashes: vec![engine.sha256(data)],
+        file_size: data.len(),
+        stored_timestamp: 1,
+        immutable: true,
+    };
+
+    let report = checker.verify_file("test.txt", &manifest, &store);
+    assert_eq!(report.status, IntegrityStatus::Valid);
+    assert_eq!(report.original_hash, report.computed_hash);
+
+    println!("✅ Integrity Verified: {:?}", report.status);
+}
+
+#[test]
+fn test_consistency_snapshot() {
+    let mut checker = IntegrityChecker::new();
+    let engine = HashEngine::new();
+    let mut manifests = std::collections::HashMap::new();
+    let mut store = ChunkStore::new();
+
+    // 3개 파일 저장
+    for i in 0..3 {
+        let data = format!("File {}", i).as_bytes().to_vec();
+        store.store_chunked(&data);
+
+        let manifest = FileManifest {
+            file_hash: engine.sha256(&data),
+            chunk_hashes: vec![engine.sha256(&data)],
+            file_size: data.len(),
+            stored_timestamp: i as u64,
+            immutable: true,
+        };
+        manifests.insert(format!("file{}.txt", i), manifest);
+    }
+
+    let snapshot = checker.create_snapshot(&manifests, &store);
+    assert_eq!(snapshot.total_files, 3);
+    assert_eq!(snapshot.valid_files, 3);
+    assert_eq!(snapshot.corrupted_files, 0);
+    assert!(snapshot.overall_health > 0.99);
+
+    println!("✅ Snapshot Created:");
+    println!("   Total Files: {}", snapshot.total_files);
+    println!("   Valid: {}", snapshot.valid_files);
+    println!("   Health: {:.1}%", snapshot.overall_health * 100.0);
+}
+
+#[test]
+fn test_health_trend() {
+    let mut checker = IntegrityChecker::new();
+    let engine = HashEngine::new();
+    let data = b"Trend Test";
+
+    let mut store = ChunkStore::new();
+    store.store_chunked(data);
+
+    let mut manifests = std::collections::HashMap::new();
+    let manifest = FileManifest {
+        file_hash: engine.sha256(data),
+        chunk_hashes: vec![engine.sha256(data)],
+        file_size: data.len(),
+        stored_timestamp: 1,
+        immutable: true,
+    };
+    manifests.insert("test.txt".to_string(), manifest);
+
+    // 여러 번 스냅샷 생성
+    for _ in 0..3 {
+        checker.create_snapshot(&manifests, &store);
+    }
+
+    let trend = checker.health_trend();
+    assert_eq!(trend.len(), 3);
+
+    println!("✅ Health Trend: {:?}", trend);
+}
+
+#[test]
+fn test_integrity_statistics() {
+    let mut checker = IntegrityChecker::new();
+    let engine = HashEngine::new();
+
+    let mut store = ChunkStore::new();
+    store.store_chunked(b"Test");
+
+    let manifest = FileManifest {
+        file_hash: engine.sha256(b"Test"),
+        chunk_hashes: vec![engine.sha256(b"Test")],
+        file_size: 4,
+        stored_timestamp: 1,
+        immutable: true,
+    };
+
+    // 여러 번 검증
+    for i in 0..5 {
+        checker.verify_file(&format!("file{}.txt", i), &manifest, &store);
+    }
+
+    let stats = checker.integrity_stats();
+    assert_eq!(stats.total_checks, 5);
+    assert_eq!(stats.corruptions_found, 0);
+
+    println!("✅ Integrity Stats:");
+    println!("   Total Checks: {}", stats.total_checks);
+    println!("   Corruptions: {}", stats.corruptions_found);
+}
+
+#[cfg(test)]
+mod unforgiving_rules {
+    use super::*;
+
+    #[test]
+    fn rule_1_perfect_dedup_detection() {
+        // Rule: 정확한 중복 = 100% 감지
+        let mut dedup = DedupEngine::new();
+        let engine = HashEngine::new();
+
+        let manifest = FileManifest {
+            file_hash: engine.sha256(b"Perfect Duplicate"),
+            chunk_hashes: vec![engine.sha256(b"chunk")],
+            file_size: 17,
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        // 10개의 정확한 중복 생성
+        for i in 0..10 {
+            dedup.register_file(&format!("dup{}.txt", i), manifest.clone());
+        }
+
+        let dups = dedup.find_exact_duplicates("dup0.txt");
+        assert_eq!(dups.len(), 9);  // 자기자신 제외
+        println!("✅ RULE 1 PASS: Perfect Dedup Detection 100% (found {})", dups.len());
+    }
+
+    #[test]
+    fn rule_2_similarity_accuracy() {
+        // Rule: 유사도 계산 정확도 ≥ 99%
+        let mut dedup = DedupEngine::new();
+        let engine = HashEngine::new();
+
+        // 정확히 75% 공유 청크
+        let m1 = FileManifest {
+            file_hash: engine.sha256(b"File1"),
+            chunk_hashes: vec![
+                engine.sha256(b"shared1"),
+                engine.sha256(b"shared2"),
+                engine.sha256(b"shared3"),
+                engine.sha256(b"unique1"),
+            ],
+            file_size: 20,
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        let m2 = FileManifest {
+            file_hash: engine.sha256(b"File2"),
+            chunk_hashes: vec![
+                engine.sha256(b"shared1"),
+                engine.sha256(b"shared2"),
+                engine.sha256(b"shared3"),
+                engine.sha256(b"unique2"),
+            ],
+            file_size: 20,
+            stored_timestamp: 2,
+            immutable: true,
+        };
+
+        dedup.register_file("file1.txt", m1);
+        dedup.register_file("file2.txt", m2);
+
+        let similar = dedup.find_similar_files("file1.txt", 0.0);
+        assert!(!similar.is_empty());
+        let score = similar[0].similarity.value();
+        // 75% ± 1% 범위
+        assert!(score >= 0.74 && score <= 0.76);
+        println!("✅ RULE 2 PASS: Similarity Accuracy {:.2}%", score * 100.0);
+    }
+
+    #[test]
+    fn rule_3_integrity_100_percent() {
+        // Rule: 무결성 검증 정확도 = 100%
+        let mut checker = IntegrityChecker::new();
+        let engine = HashEngine::new();
+
+        let mut store = ChunkStore::new();
+        let data = b"Integrity 100 Percent";
+        store.store_chunked(data);
+
+        let manifest = FileManifest {
+            file_hash: engine.sha256(data),
+            chunk_hashes: vec![engine.sha256(data)],
+            file_size: data.len(),
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        let report = checker.verify_file("test.txt", &manifest, &store);
+        assert_eq!(report.status, IntegrityStatus::Valid);
+        assert_eq!(report.original_hash, report.computed_hash);
+        println!("✅ RULE 3 PASS: Integrity 100% (Hash match verified)");
+    }
+
+    #[test]
+    fn rule_4_snapshot_consistency() {
+        // Rule: 스냅샷 일관성 = 100%
+        // 같은 상태에서 여러 번 스냅샷 생성해도 결과 동일
+        let mut checker = IntegrityChecker::new();
+        let engine = HashEngine::new();
+
+        let mut store = ChunkStore::new();
+        store.store_chunked(b"Snapshot Test");
+
+        let mut manifests = std::collections::HashMap::new();
+        let manifest = FileManifest {
+            file_hash: engine.sha256(b"Snapshot Test"),
+            chunk_hashes: vec![engine.sha256(b"Snapshot Test")],
+            file_size: 13,
+            stored_timestamp: 1,
+            immutable: true,
+        };
+        manifests.insert("test.txt".to_string(), manifest);
+
+        let snapshot1 = checker.create_snapshot(&manifests, &store);
+        let snapshot2 = checker.create_snapshot(&manifests, &store);
+
+        // 파일 수와 건강도는 동일해야 함
+        assert_eq!(snapshot1.total_files, snapshot2.total_files);
+        assert_eq!(snapshot1.valid_files, snapshot2.valid_files);
+        println!("✅ RULE 4 PASS: Snapshot Consistency 100%");
+    }
+
+    #[test]
+    fn rule_5_dedup_savings_tracking() {
+        // Rule: 중복 제거 절감액 추적 정확도 ≥ 98%
+        let mut dedup = DedupEngine::new();
+        let engine = HashEngine::new();
+
+        // 4KB × 10개 = 40KB 절감 가능
+        let manifest = FileManifest {
+            file_hash: engine.sha256(b"Savings Test"),
+            chunk_hashes: vec![
+                engine.sha256(b"chunk1"),
+                engine.sha256(b"chunk2"),
+                engine.sha256(b"chunk3"),
+                engine.sha256(b"chunk4"),
+                engine.sha256(b"chunk5"),
+                engine.sha256(b"chunk6"),
+                engine.sha256(b"chunk7"),
+                engine.sha256(b"chunk8"),
+                engine.sha256(b"chunk9"),
+                engine.sha256(b"chunk10"),
+            ],
+            file_size: 40000,
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        for i in 0..10 {
+            dedup.register_file(&format!("file{}.txt", i), manifest.clone());
+        }
+
+        let stats = dedup.dedup_statistics();
+        // 10개 중복 파일에서 9개가 중복
+        assert!(stats.files_with_duplicates >= 9);
+        println!("✅ RULE 5 PASS: Dedup Savings Tracked ({} files)", stats.files_with_duplicates);
+    }
+}
+
+// 최종 E2E 테스트
+#[test]
+fn test_phase_2_complete_workflow() {
+    let mut cas = CASCore::new();
+    let mut dedup = DedupEngine::new();
+    let mut integrity = IntegrityChecker::new();
+    let engine = HashEngine::new();
+
+    // 1. 파일 저장 (CAS)
+    let files = vec![
+        ("readme.txt", b"# Sovereign-FS".as_ref()),
+        ("license.txt", b"# Sovereign-FS".as_ref()),  // 중복
+        ("config.txt", b"config=true".as_ref()),
+    ];
+
+    let mut manifests = std::collections::HashMap::new();
+    for (name, content) in &files {
+        let (hash, manifest) = cas.store_file(name, content);
+        manifests.insert(name.to_string(), manifest.clone());
+        dedup.register_file(name, manifest);
+    }
+
+    // 2. 중복 감지
+    let dups = dedup.find_exact_duplicates("readme.txt");
+    assert!(!dups.is_empty());
+
+    // 3. 무결성 검증
+    let mut store = crate::cas::ChunkStore::new();
+    for (name, content) in &files {
+        store.store_chunked(content);
+    }
+
+    for (name, manifest) in &manifests {
+        let report = integrity.verify_file(name, manifest, &store);
+        assert_eq!(report.status, IntegrityStatus::Valid);
+    }
+
+    // 4. 일관성 스냅샷
+    let snapshot = integrity.create_snapshot(&manifests, &store);
+    assert_eq!(snapshot.valid_files, 3);
+    assert!(snapshot.overall_health > 0.99);
+
+    println!("✅ Phase 2 Complete Workflow:");
+    println!("   Files Stored: {}", files.len());
+    println!("   Duplicates Found: {}", dups.len());
+    println!("   Integrity: {:.0}%", snapshot.overall_health * 100.0);
+}

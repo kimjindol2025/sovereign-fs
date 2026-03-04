@@ -1,15 +1,19 @@
-// Phase 2: Deduplication + Integrity Verification
-// 중복 제거 및 무결성 검증 계층 (향후 구현)
+// Phase 2: Deduplication Module
 
-// 계획:
-// - Advanced Deduplication Strategy
-// - Incremental Integrity Checks
-// - Consistency Snapshots
+pub mod dedup_engine;
+
+pub use dedup_engine::{
+    DedupEngine, SimilarityScore, SimilarContent,
+    DedupStrategy, DedupRecommendation, DedupStats,
+};
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn test_phase_2_placeholder() {
-        // Phase 2 구현 예정
+    fn test_dedup_module_exports() {
+        let engine = DedupEngine::new();
+        assert_eq!(engine.manifests.len(), 0);
     }
 }

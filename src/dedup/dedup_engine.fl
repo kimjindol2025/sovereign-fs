@@ -1,0 +1,404 @@
+// Phase 2: Advanced Deduplication Engine
+// 고급 중복 제거: 정확한 중복 + 유사한 콘텐츠 감지
+
+use crate::cas::*;
+use std::collections::HashMap;
+
+/// 유사도 점수 (0.0 ~ 1.0)
+/// 1.0 = 정확히 동일
+/// 0.9+ = 매우 유사 (99%+ 일치)
+/// 0.7+ = 유사 (70%+ 일치)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SimilarityScore(f64);
+
+impl SimilarityScore {
+    pub fn new(score: f64) -> Self {
+        SimilarityScore(score.max(0.0).min(1.0))
+    }
+
+    pub fn value(&self) -> f64 {
+        self.0
+    }
+
+    pub fn is_identical(&self) -> bool {
+        (self.0 - 1.0).abs() < 0.0001
+    }
+
+    pub fn is_very_similar(&self) -> bool {
+        self.0 >= 0.99
+    }
+
+    pub fn is_similar(&self) -> bool {
+        self.0 >= 0.70
+    }
+}
+
+/// 유사한 파일 후보
+#[derive(Clone, Debug)]
+pub struct SimilarContent {
+    pub file_hash: String,      // 파일명
+    pub similarity: SimilarityScore,
+    pub shared_chunks: usize,   // 공유 청크 수
+    pub total_chunks: usize,    // 전체 청크 수
+    pub potential_savings: usize, // 절감 가능 바이트
+}
+
+/// 고급 중복 제거 엔진
+pub struct DedupEngine {
+    // 파일명 → 매니페스트
+    manifests: HashMap<String, FileManifest>,
+    // 청크 해시 → 파일 리스트
+    chunk_to_files: HashMap<String, Vec<String>>,
+    // 통계
+    total_dedup_found: usize,
+    total_savings: usize,
+}
+
+impl DedupEngine {
+    pub fn new() -> Self {
+        DedupEngine {
+            manifests: HashMap::new(),
+            chunk_to_files: HashMap::new(),
+            total_dedup_found: 0,
+            total_savings: 0,
+        }
+    }
+
+    /// 파일 등록 (매니페스트 기반)
+    pub fn register_file(&mut self, filename: &str, manifest: FileManifest) {
+        self.manifests.insert(filename.to_string(), manifest.clone());
+
+        // 청크 역 인덱스 생성
+        for chunk_hash in &manifest.chunk_hashes {
+            let hash_hex = chunk_hash.to_hex();
+            self.chunk_to_files
+                .entry(hash_hex)
+                .or_insert_with(Vec::new)
+                .push(filename.to_string());
+        }
+    }
+
+    /// 정확한 중복 파일 찾기
+    pub fn find_exact_duplicates(&self, filename: &str) -> Vec<String> {
+        if let Some(manifest) = self.manifests.get(filename) {
+            let mut duplicates = Vec::new();
+
+            // 이 파일의 청크들을 공유하는 다른 파일들 찾기
+            for chunk_hash in &manifest.chunk_hashes {
+                let hash_hex = chunk_hash.to_hex();
+                if let Some(files_using_chunk) = self.chunk_to_files.get(&hash_hex) {
+                    duplicates.extend(files_using_chunk.clone());
+                }
+            }
+
+            // 자기 자신 제거 및 정렬
+            duplicates.sort();
+            duplicates.dedup();
+            duplicates.retain(|f| f != filename);
+            duplicates
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 유사한 파일 찾기 (Content-based Similarity)
+    pub fn find_similar_files(&self, filename: &str, threshold: f64) -> Vec<SimilarContent> {
+        if let Some(target_manifest) = self.manifests.get(filename) {
+            let mut similar_files = Vec::new();
+
+            for (other_name, other_manifest) in &self.manifests {
+                if other_name == filename {
+                    continue;
+                }
+
+                // 유사도 계산: 공유 청크 비율
+                let (shared_count, similarity) = self.calculate_similarity(
+                    target_manifest,
+                    other_manifest,
+                );
+
+                if similarity.value() >= threshold {
+                    let potential_savings = self.calculate_savings(
+                        target_manifest,
+                        other_manifest,
+                        shared_count,
+                    );
+
+                    similar_files.push(SimilarContent {
+                        file_hash: other_name.clone(),
+                        similarity,
+                        shared_chunks: shared_count,
+                        total_chunks: other_manifest.chunk_hashes.len(),
+                        potential_savings,
+                    });
+                }
+            }
+
+            // 유사도 높은 순서로 정렬
+            similar_files.sort_by(|a, b| {
+                b.similarity.value()
+                    .partial_cmp(&a.similarity.value())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            similar_files
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 중복 제거 전략: 어느 파일을 유지할지 결정
+    pub fn dedup_strategy(&self, filename: &str) -> DedupStrategy {
+        let duplicates = self.find_exact_duplicates(filename);
+        let similar = self.find_similar_files(filename, 0.70);
+
+        let total_potential = duplicates.len() + similar.len();
+        let total_savings: usize = similar.iter().map(|s| s.potential_savings).sum();
+
+        DedupStrategy {
+            target_file: filename.to_string(),
+            exact_duplicates: duplicates.len(),
+            similar_files: similar.len(),
+            total_potential_savings: total_savings,
+            recommendation: if total_potential > 0 {
+                DedupRecommendation::Consolidate
+            } else {
+                DedupRecommendation::Keep
+            },
+        }
+    }
+
+    /// 모든 파일의 중복 통계
+    pub fn dedup_statistics(&self) -> DedupStats {
+        let mut exact_dup_groups = 0;
+        let mut similar_groups = 0;
+        let mut total_duplicated_files = 0;
+
+        let mut checked = std::collections::HashSet::new();
+
+        for filename in self.manifests.keys() {
+            if checked.contains(filename) {
+                continue;
+            }
+
+            let exact_dups = self.find_exact_duplicates(filename);
+            if !exact_dups.is_empty() {
+                exact_dup_groups += 1;
+                total_duplicated_files += 1 + exact_dups.len();
+                for dup in &exact_dups {
+                    checked.insert(dup.clone());
+                }
+            }
+
+            let similar = self.find_similar_files(filename, 0.70);
+            if !similar.is_empty() {
+                similar_groups += 1;
+            }
+
+            checked.insert(filename.clone());
+        }
+
+        DedupStats {
+            total_files: self.manifests.len(),
+            exact_duplicate_groups: exact_dup_groups,
+            similar_groups,
+            files_with_duplicates: total_duplicated_files,
+            dedup_percentage: if self.manifests.len() > 0 {
+                (total_duplicated_files as f64 / self.manifests.len() as f64) * 100.0
+            } else {
+                0.0
+            },
+        }
+    }
+
+    // ===== Private Methods =====
+
+    fn calculate_similarity(
+        &self,
+        manifest1: &FileManifest,
+        manifest2: &FileManifest,
+    ) -> (usize, SimilarityScore) {
+        let hashes1: std::collections::HashSet<_> = manifest1
+            .chunk_hashes
+            .iter()
+            .map(|h| h.to_hex())
+            .collect();
+        let hashes2: std::collections::HashSet<_> = manifest2
+            .chunk_hashes
+            .iter()
+            .map(|h| h.to_hex())
+            .collect();
+
+        let shared = hashes1.intersection(&hashes2).count();
+        let total = hashes1.union(&hashes2).count();
+
+        let similarity = if total > 0 {
+            shared as f64 / total as f64
+        } else {
+            0.0
+        };
+
+        (shared, SimilarityScore::new(similarity))
+    }
+
+    fn calculate_savings(
+        &self,
+        _manifest1: &FileManifest,
+        manifest2: &FileManifest,
+        shared_chunks: usize,
+    ) -> usize {
+        // 각 청크는 약 4KB
+        shared_chunks * 4096
+    }
+}
+
+/// 중복 제거 전략
+#[derive(Clone, Debug)]
+pub struct DedupStrategy {
+    pub target_file: String,
+    pub exact_duplicates: usize,
+    pub similar_files: usize,
+    pub total_potential_savings: usize,
+    pub recommendation: DedupRecommendation,
+}
+
+/// 중복 제거 권장사항
+#[derive(Clone, Debug, PartialEq)]
+pub enum DedupRecommendation {
+    Keep,           // 현재 상태 유지
+    Consolidate,    // 중복 파일 통합
+    Archive,        // 아카이브로 이동
+}
+
+/// 중복 제거 통계
+#[derive(Clone, Debug)]
+pub struct DedupStats {
+    pub total_files: usize,
+    pub exact_duplicate_groups: usize,
+    pub similar_groups: usize,
+    pub files_with_duplicates: usize,
+    pub dedup_percentage: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dedup_engine_creation() {
+        let engine = DedupEngine::new();
+        assert_eq!(engine.manifests.len(), 0);
+    }
+
+    #[test]
+    fn test_similarity_score() {
+        let score1 = SimilarityScore::new(1.0);
+        assert!(score1.is_identical());
+
+        let score2 = SimilarityScore::new(0.99);
+        assert!(score2.is_very_similar());
+
+        let score3 = SimilarityScore::new(0.75);
+        assert!(score3.is_similar());
+        assert!(!score3.is_very_similar());
+    }
+
+    #[test]
+    fn test_find_exact_duplicates() {
+        let mut engine = DedupEngine::new();
+        let engine_hash = HashEngine::new();
+
+        // 같은 내용의 두 파일
+        let manifest1 = FileManifest {
+            file_hash: engine_hash.sha256(b"content"),
+            chunk_hashes: vec![engine_hash.sha256(b"chunk")],
+            file_size: 5,
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        engine.register_file("file1.txt", manifest1.clone());
+        engine.register_file("file2.txt", manifest1.clone());
+
+        let duplicates = engine.find_exact_duplicates("file1.txt");
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0], "file2.txt");
+    }
+
+    #[test]
+    fn test_find_similar_files() {
+        let mut engine = DedupEngine::new();
+        let engine_hash = HashEngine::new();
+
+        // 부분 공유 청크
+        let manifest1 = FileManifest {
+            file_hash: engine_hash.sha256(b"content1"),
+            chunk_hashes: vec![
+                engine_hash.sha256(b"chunk_a"),
+                engine_hash.sha256(b"chunk_b"),
+            ],
+            file_size: 10,
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        let manifest2 = FileManifest {
+            file_hash: engine_hash.sha256(b"content2"),
+            chunk_hashes: vec![
+                engine_hash.sha256(b"chunk_a"),
+                engine_hash.sha256(b"chunk_c"),
+            ],
+            file_size: 10,
+            stored_timestamp: 2,
+            immutable: true,
+        };
+
+        engine.register_file("file1.txt", manifest1);
+        engine.register_file("file2.txt", manifest2);
+
+        let similar = engine.find_similar_files("file1.txt", 0.30);
+        assert!(!similar.is_empty());
+        assert!(similar[0].similarity.value() > 0.0);
+    }
+
+    #[test]
+    fn test_dedup_statistics() {
+        let mut engine = DedupEngine::new();
+        let engine_hash = HashEngine::new();
+
+        let manifest = FileManifest {
+            file_hash: engine_hash.sha256(b"test"),
+            chunk_hashes: vec![engine_hash.sha256(b"chunk")],
+            file_size: 4,
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        engine.register_file("file1.txt", manifest.clone());
+        engine.register_file("file2.txt", manifest);
+
+        let stats = engine.dedup_statistics();
+        assert_eq!(stats.total_files, 2);
+        assert!(stats.files_with_duplicates > 0);
+    }
+
+    #[test]
+    fn test_dedup_strategy() {
+        let mut engine = DedupEngine::new();
+        let engine_hash = HashEngine::new();
+
+        let manifest = FileManifest {
+            file_hash: engine_hash.sha256(b"test"),
+            chunk_hashes: vec![engine_hash.sha256(b"chunk")],
+            file_size: 4,
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        engine.register_file("file1.txt", manifest.clone());
+        engine.register_file("file2.txt", manifest);
+
+        let strategy = engine.dedup_strategy("file1.txt");
+        assert!(strategy.exact_duplicates > 0);
+    }
+}
