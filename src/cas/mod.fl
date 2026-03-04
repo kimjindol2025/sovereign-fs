@@ -1,0 +1,57 @@
+// Phase 1: Content-Addressable Storage Module
+// CAS 엔진의 핵심 계층
+
+pub mod hash_engine;
+pub mod chunk_store;
+pub mod cas_core;
+
+pub use hash_engine::{Hash256, HashEngine};
+pub use chunk_store::{ChunkStore, ChunkMetadata, CHUNK_SIZE};
+pub use cas_core::{CASCore, FileManifest, CASStats, FileInfo};
+
+/// Phase 1: CAS 시스템 초기화
+pub struct Phase1CAS {
+    pub core: CASCore,
+}
+
+impl Phase1CAS {
+    pub fn new() -> Self {
+        Phase1CAS {
+            core: CASCore::new(),
+        }
+    }
+
+    /// 시스템 상태 조회
+    pub fn status(&self) -> Phase1Status {
+        let stats = self.core.storage_stats();
+        Phase1Status {
+            files_stored: stats.total_files,
+            unique_chunks: stats.unique_chunks,
+            stored_mb: stats.stored_bytes / 1_000_000,
+            dedup_rate: stats.deduplication_rate,
+            compression: stats.compression_ratio,
+        }
+    }
+}
+
+/// Phase 1 상태 정보
+#[derive(Clone, Debug)]
+pub struct Phase1Status {
+    pub files_stored: usize,
+    pub unique_chunks: usize,
+    pub stored_mb: usize,
+    pub dedup_rate: f64,
+    pub compression: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_phase1_initialization() {
+        let phase1 = Phase1CAS::new();
+        let status = phase1.status();
+        assert_eq!(status.files_stored, 0);
+    }
+}

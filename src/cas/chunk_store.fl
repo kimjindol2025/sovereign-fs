@@ -1,0 +1,341 @@
+// Phase 1: 청크 저장소 (Chunk-based Content Storage)
+// 파일을 4KB 청크로 분할하여 저장
+// 목표: 중복 청크 감지 및 제거 기초 제공
+
+use crate::cas::hash_engine::{Hash256, HashEngine};
+use std::collections::HashMap;
+
+pub const CHUNK_SIZE: usize = 4096;  // 4KB 청크
+
+/// 저장된 청크 메타데이터
+#[derive(Clone, Debug)]
+pub struct ChunkMetadata {
+    pub hash: Hash256,
+    pub size: usize,
+    pub ref_count: usize,  // 이 청크를 참조하는 파일 수
+    pub stored_at: usize,  // 저장소 오프셋 (선택)
+    pub created_ts: u64,   // 생성 시간
+}
+
+/// 청크 저장소 (CAS 백엔드)
+pub struct ChunkStore {
+    engine: HashEngine,
+    // 해시 → 청크 메타데이터
+    chunks: HashMap<String, ChunkMetadata>,
+    // 실제 청크 데이터 (시뮬레이션)
+    data: HashMap<String, Vec<u8>>,
+    total_stored: usize,
+    total_deduplicated: usize,  // 제거된 중복 바이트 수
+}
+
+impl ChunkStore {
+    pub fn new() -> Self {
+        ChunkStore {
+            engine: HashEngine::new(),
+            chunks: HashMap::new(),
+            data: HashMap::new(),
+            total_stored: 0,
+            total_deduplicated: 0,
+        }
+    }
+
+    /// 데이터를 청크로 분할하고 저장
+    /// 반환: (저장된 청크 수, 중복 바이트 수)
+    pub fn store_chunked(&mut self, data: &[u8]) -> (usize, usize) {
+        let mut stored_count = 0;
+        let mut dedup_bytes = 0;
+
+        // 데이터를 청크로 분할
+        for chunk_idx in 0..(data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE {
+            let start = chunk_idx * CHUNK_SIZE;
+            let end = std::cmp::min(start + CHUNK_SIZE, data.len());
+            let chunk = &data[start..end];
+
+            // 청크 해시 계산
+            let hash = self.engine.sha256(chunk);
+            let hash_hex = hash.to_hex();
+
+            // 중복 확인
+            if let Some(metadata) = self.chunks.get_mut(&hash_hex) {
+                // 중복: 참조 카운트만 증가
+                metadata.ref_count += 1;
+                dedup_bytes += chunk.len();
+            } else {
+                // 새 청크: 저장
+                let metadata = ChunkMetadata {
+                    hash: hash.clone(),
+                    size: chunk.len(),
+                    ref_count: 1,
+                    stored_at: self.total_stored,
+                    created_ts: self.current_timestamp(),
+                };
+                self.chunks.insert(hash_hex.clone(), metadata);
+                self.data.insert(hash_hex, chunk.to_vec());
+                self.total_stored += chunk.len();
+                stored_count += 1;
+            }
+        }
+
+        self.total_deduplicated += dedup_bytes;
+        (stored_count, dedup_bytes)
+    }
+
+    /// 청크 조회
+    pub fn get_chunk(&self, hash: &Hash256) -> Option<Vec<u8>> {
+        let hash_hex = hash.to_hex();
+        self.data.get(&hash_hex).cloned()
+    }
+
+    /// 해시로 청크 조회
+    pub fn get_chunk_by_hex(&self, hex: &str) -> Option<Vec<u8>> {
+        self.data.get(hex).cloned()
+    }
+
+    /// 청크 메타데이터 조회
+    pub fn get_metadata(&self, hash: &Hash256) -> Option<ChunkMetadata> {
+        let hash_hex = hash.to_hex();
+        self.chunks.get(&hash_hex).cloned()
+    }
+
+    /// 총 고유 청크 수
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// 저장된 바이트 수
+    pub fn stored_bytes(&self) -> usize {
+        self.total_stored
+    }
+
+    /// 중복으로 인해 절감된 바이트 수
+    pub fn deduplicated_bytes(&self) -> usize {
+        self.total_deduplicated
+    }
+
+    /// 총 저장 가능 바이트 (중복 포함)
+    pub fn total_possible_bytes(&self) -> usize {
+        self.total_stored + self.total_deduplicated
+    }
+
+    /// 중복 제거율 (%)
+    pub fn deduplication_rate(&self) -> f64 {
+        let total = self.total_possible_bytes();
+        if total == 0 {
+            0.0
+        } else {
+            (self.total_deduplicated as f64 / total as f64) * 100.0
+        }
+    }
+
+    /// 특정 청크의 참조 수
+    pub fn ref_count(&self, hash: &Hash256) -> usize {
+        let hash_hex = hash.to_hex();
+        self.chunks
+            .get(&hash_hex)
+            .map(|m| m.ref_count)
+            .unwrap_or(0)
+    }
+
+    /// 청크 참조 해제 (삭제 시)
+    pub fn dereference_chunk(&mut self, hash: &Hash256) -> bool {
+        let hash_hex = hash.to_hex();
+        if let Some(metadata) = self.chunks.get_mut(&hash_hex) {
+            if metadata.ref_count > 1 {
+                metadata.ref_count -= 1;
+                false  // 청크는 아직 사용 중
+            } else {
+                true   // 청크 삭제 가능
+            }
+        } else {
+            false
+        }
+    }
+
+    /// 참조 카운트가 0이 된 청크 제거
+    pub fn garbage_collect(&mut self) -> usize {
+        let mut removed = 0;
+        let to_remove: Vec<String> = self
+            .chunks
+            .iter()
+            .filter(|(_, m)| m.ref_count == 0)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for hash_hex in to_remove {
+            if let Some(metadata) = self.chunks.remove(&hash_hex) {
+                self.total_stored -= metadata.size;
+                self.data.remove(&hash_hex);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// 저장소 통계
+    pub fn stats(&self) -> StorageStats {
+        StorageStats {
+            chunk_count: self.chunk_count(),
+            stored_bytes: self.total_stored,
+            deduplicated_bytes: self.total_deduplicated,
+            deduplication_rate: self.deduplication_rate(),
+            total_possible: self.total_possible_bytes(),
+        }
+    }
+
+    #[inline]
+    fn current_timestamp(&self) -> u64 {
+        // 시뮬레이션: 간단한 카운터
+        self.chunks.len() as u64
+    }
+}
+
+/// 저장소 통계
+#[derive(Clone, Debug)]
+pub struct StorageStats {
+    pub chunk_count: usize,
+    pub stored_bytes: usize,
+    pub deduplicated_bytes: usize,
+    pub deduplication_rate: f64,
+    pub total_possible: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chunk_store_creation() {
+        let store = ChunkStore::new();
+        assert_eq!(store.chunk_count(), 0);
+        assert_eq!(store.stored_bytes(), 0);
+    }
+
+    #[test]
+    fn test_single_chunk_storage() {
+        let mut store = ChunkStore::new();
+        let data = vec![0x42; 1000];  // 1KB 데이터
+
+        let (stored, dedup) = store.store_chunked(&data);
+        assert_eq!(stored, 1);  // 1개 청크 저장
+        assert_eq!(dedup, 0);   // 중복 없음
+        assert_eq!(store.chunk_count(), 1);
+    }
+
+    #[test]
+    fn test_multi_chunk_storage() {
+        let mut store = ChunkStore::new();
+        let data = vec![0x42; 10000];  // 10KB 데이터 = 3개 청크 (4KB+4KB+2KB)
+
+        let (stored, dedup) = store.store_chunked(&data);
+        assert!(stored > 0);
+        assert_eq!(store.chunk_count(), stored);
+    }
+
+    #[test]
+    fn test_deduplication() {
+        let mut store = ChunkStore::new();
+        let data = vec![0x42; 8192];  // 8KB
+
+        store.store_chunked(&data);
+        let (stored, dedup) = store.store_chunked(&data);  // 같은 데이터 다시 저장
+
+        assert_eq!(stored, 0);   // 새 청크 없음
+        assert!(dedup > 0);      // 중복 감지됨
+    }
+
+    #[test]
+    fn test_deduplication_rate() {
+        let mut store = ChunkStore::new();
+        let data = vec![0x42; 4096];
+
+        store.store_chunked(&data);
+        store.store_chunked(&data);  // 2번 저장
+
+        let rate = store.deduplication_rate();
+        assert!(rate > 0.0 && rate <= 100.0);
+        assert!(rate > 40.0);  // 약 50%
+    }
+
+    #[test]
+    fn test_chunk_retrieval() {
+        let mut store = ChunkStore::new();
+        let data = vec![0xAB; 1000];
+
+        store.store_chunked(&data);
+        let stats = store.stats();
+        assert_eq!(stats.chunk_count, 1);
+    }
+
+    #[test]
+    fn test_ref_count() {
+        let mut store = ChunkStore::new();
+        let data = vec![0x55; 2000];
+
+        store.store_chunked(&data);
+        let first_chunk = store.chunks.iter().next().unwrap().0.clone();
+
+        store.store_chunked(&data);  // 다시 저장
+
+        if let Ok(hash) = Hash256::from_hex(&first_chunk) {
+            let count = store.ref_count(&hash);
+            assert!(count > 0);
+        }
+    }
+
+    #[test]
+    fn test_garbage_collection() {
+        let mut store = ChunkStore::new();
+        let data = vec![0x77; 2000];
+
+        store.store_chunked(&data);
+        let initial = store.chunk_count();
+
+        // 참조 카운트를 0으로 설정하는 시뮬레이션
+        for (_, metadata) in store.chunks.iter_mut() {
+            metadata.ref_count = 0;
+        }
+
+        let removed = store.garbage_collect();
+        assert_eq!(removed, initial);
+        assert_eq!(store.chunk_count(), 0);
+    }
+
+    #[test]
+    fn test_storage_stats() {
+        let mut store = ChunkStore::new();
+        let data = vec![0x99; 5000];
+
+        store.store_chunked(&data);
+        let stats = store.stats();
+
+        assert!(stats.chunk_count > 0);
+        assert!(stats.stored_bytes > 0);
+        assert_eq!(stats.deduplication_rate, 0.0);  // 첫 저장
+    }
+
+    #[test]
+    fn test_chunk_size_boundary() {
+        let mut store = ChunkStore::new();
+        // 정확히 4096 바이트
+        let data = vec![0x11; CHUNK_SIZE];
+
+        let (stored, _) = store.store_chunked(&data);
+        assert_eq!(stored, 1);
+    }
+
+    #[test]
+    fn test_multiple_different_chunks() {
+        let mut store = ChunkStore::new();
+
+        let data1 = vec![0xAA; 2000];
+        let data2 = vec![0xBB; 2000];
+        let data3 = vec![0xCC; 2000];
+
+        store.store_chunked(&data1);
+        store.store_chunked(&data2);
+        store.store_chunked(&data3);
+
+        // 3개의 다른 데이터 = 최소 3개 청크
+        assert!(store.chunk_count() >= 3);
+    }
+}

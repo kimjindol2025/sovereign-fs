@@ -1,0 +1,377 @@
+// Phase 1: Content-Addressable Storage 핵심 엔진
+// 파일을 해시값으로 주소 지정하고 변조 불가능성 보장
+
+use crate::cas::hash_engine::{Hash256, HashEngine};
+use crate::cas::chunk_store::{ChunkStore, CHUNK_SIZE};
+use std::collections::HashMap;
+
+/// 파일 메니페스트 (파일의 청크 구조)
+#[derive(Clone, Debug)]
+pub struct FileManifest {
+    pub file_hash: Hash256,           // 파일 전체 해시
+    pub chunk_hashes: Vec<Hash256>,   // 청크 해시들
+    pub file_size: usize,
+    pub stored_timestamp: u64,
+    pub immutable: bool,              // 변조 불가능 플래그
+}
+
+impl FileManifest {
+    /// 무결성 검증: 현재 청크들의 해시가 매니페스트와 일치하는지 확인
+    pub fn verify_integrity(&self, store: &ChunkStore) -> bool {
+        let mut reconstructed = Vec::new();
+
+        for chunk_hash in &self.chunk_hashes {
+            if let Some(chunk) = store.get_chunk(chunk_hash) {
+                reconstructed.extend_from_slice(&chunk);
+            } else {
+                return false;  // 청크 누락
+            }
+        }
+
+        // 재구성된 파일의 해시 계산
+        let engine = HashEngine::new();
+        let recalc_hash = engine.sha256(&reconstructed);
+
+        // 원래 파일 해시와 비교
+        recalc_hash == self.file_hash
+    }
+}
+
+/// Content-Addressable Storage 코어
+pub struct CASCore {
+    store: ChunkStore,
+    engine: HashEngine,
+    // 파일명 → 매니페스트 (선택적, CAS의 주요 기능 아님)
+    manifests: HashMap<String, FileManifest>,
+    total_files: usize,
+}
+
+impl CASCore {
+    pub fn new() -> Self {
+        CASCore {
+            store: ChunkStore::new(),
+            engine: HashEngine::new(),
+            manifests: HashMap::new(),
+            total_files: 0,
+        }
+    }
+
+    /// 파일 저장 (CAS 방식)
+    /// 반환: (파일 해시, 매니페스트)
+    pub fn store_file(&mut self, filename: &str, data: &[u8]) -> (Hash256, FileManifest) {
+        // 파일 전체 해시 계산
+        let file_hash = self.engine.sha256(data);
+
+        // 청크로 분할하여 저장
+        self.store.store_chunked(data);
+
+        // 매니페스트 생성
+        let chunk_hashes = self.chunk_hashes(data);
+        let manifest = FileManifest {
+            file_hash: file_hash.clone(),
+            chunk_hashes,
+            file_size: data.len(),
+            stored_timestamp: self.current_timestamp(),
+            immutable: true,  // CAS의 핵심: 저장되는 순간 불변
+        };
+
+        self.manifests.insert(filename.to_string(), manifest.clone());
+        self.total_files += 1;
+
+        (file_hash, manifest)
+    }
+
+    /// 파일 복원 (해시로부터)
+    pub fn retrieve_file(&self, file_hash: &Hash256) -> Option<Vec<u8>> {
+        // 매니페스트 찾기
+        for (_, manifest) in &self.manifests {
+            if manifest.file_hash == *file_hash {
+                return Some(self.reconstruct_from_manifest(manifest));
+            }
+        }
+        None
+    }
+
+    /// 파일명으로 복원
+    pub fn retrieve_by_name(&self, filename: &str) -> Option<Vec<u8>> {
+        self.manifests
+            .get(filename)
+            .map(|m| self.reconstruct_from_manifest(m))
+    }
+
+    /// 무결성 검증
+    pub fn verify_file(&self, file_hash: &Hash256) -> bool {
+        for (_, manifest) in &self.manifests {
+            if manifest.file_hash == *file_hash {
+                return manifest.verify_integrity(&self.store);
+            }
+        }
+        false
+    }
+
+    /// 파일명으로 무결성 검증
+    pub fn verify_by_name(&self, filename: &str) -> bool {
+        if let Some(manifest) = self.manifests.get(filename) {
+            manifest.verify_integrity(&self.store)
+        } else {
+            false
+        }
+    }
+
+    /// 중복 제거율
+    pub fn deduplication_ratio(&self) -> f64 {
+        self.store.deduplication_rate()
+    }
+
+    /// 저장소 통계
+    pub fn storage_stats(&self) -> CASStats {
+        let store_stats = self.store.stats();
+        CASStats {
+            total_files: self.total_files,
+            unique_chunks: store_stats.chunk_count,
+            stored_bytes: store_stats.stored_bytes,
+            deduplicated_bytes: store_stats.deduplicated_bytes,
+            deduplication_rate: store_stats.deduplication_rate,
+            compression_ratio: if store_stats.total_possible > 0 {
+                store_stats.stored_bytes as f64 / store_stats.total_possible as f64
+            } else {
+                1.0
+            },
+        }
+    }
+
+    /// 변조 가능 여부 검사 (CAS의 핵심 특성)
+    pub fn is_immutable(&self, filename: &str) -> bool {
+        self.manifests
+            .get(filename)
+            .map(|m| m.immutable)
+            .unwrap_or(false)
+    }
+
+    /// 모든 파일 나열
+    pub fn list_files(&self) -> Vec<String> {
+        self.manifests.keys().cloned().collect()
+    }
+
+    /// 파일 메타데이터
+    pub fn file_info(&self, filename: &str) -> Option<FileInfo> {
+        self.manifests.get(filename).map(|m| FileInfo {
+            hash: m.file_hash.to_hex(),
+            size: m.file_size,
+            chunks: m.chunk_hashes.len(),
+            immutable: m.immutable,
+            timestamp: m.stored_timestamp,
+        })
+    }
+
+    // ===== Private Methods =====
+
+    /// 파일의 청크 해시들 계산
+    fn chunk_hashes(&self, data: &[u8]) -> Vec<Hash256> {
+        let mut hashes = Vec::new();
+
+        for chunk_idx in 0..(data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE {
+            let start = chunk_idx * CHUNK_SIZE;
+            let end = std::cmp::min(start + CHUNK_SIZE, data.len());
+            let chunk = &data[start..end];
+
+            let hash = self.engine.sha256(chunk);
+            hashes.push(hash);
+        }
+
+        hashes
+    }
+
+    /// 매니페스트로부터 파일 재구성
+    fn reconstruct_from_manifest(&self, manifest: &FileManifest) -> Vec<u8> {
+        let mut result = Vec::new();
+
+        for chunk_hash in &manifest.chunk_hashes {
+            if let Some(chunk) = self.store.get_chunk(chunk_hash) {
+                result.extend_from_slice(&chunk);
+            }
+        }
+
+        // 파일 크기로 트림
+        result.truncate(manifest.file_size);
+        result
+    }
+
+    #[inline]
+    fn current_timestamp(&self) -> u64 {
+        self.total_files as u64
+    }
+}
+
+/// CAS 저장소 통계
+#[derive(Clone, Debug)]
+pub struct CASStats {
+    pub total_files: usize,
+    pub unique_chunks: usize,
+    pub stored_bytes: usize,
+    pub deduplicated_bytes: usize,
+    pub deduplication_rate: f64,
+    pub compression_ratio: f64,
+}
+
+/// 파일 정보
+#[derive(Clone, Debug)]
+pub struct FileInfo {
+    pub hash: String,
+    pub size: usize,
+    pub chunks: usize,
+    pub immutable: bool,
+    pub timestamp: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cas_core_creation() {
+        let cas = CASCore::new();
+        assert_eq!(cas.total_files, 0);
+    }
+
+    #[test]
+    fn test_store_file() {
+        let mut cas = CASCore::new();
+        let data = b"Hello, Sovereign-FS!";
+
+        let (hash, manifest) = cas.store_file("test.txt", data);
+        assert!(!hash.to_hex().is_empty());
+        assert!(!manifest.chunk_hashes.is_empty());
+        assert_eq!(manifest.file_size, data.len());
+        assert!(manifest.immutable);
+    }
+
+    #[test]
+    fn test_retrieve_file() {
+        let mut cas = CASCore::new();
+        let data = b"Content-Addressable Storage Test";
+
+        let (hash, _) = cas.store_file("test.txt", data);
+        let retrieved = cas.retrieve_file(&hash).unwrap();
+
+        assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn test_retrieve_by_name() {
+        let mut cas = CASCore::new();
+        let data = b"Sovereign-FS Test Data";
+
+        cas.store_file("test.txt", data);
+        let retrieved = cas.retrieve_by_name("test.txt").unwrap();
+
+        assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn test_immutability_property() {
+        let mut cas = CASCore::new();
+        let data = b"Immutable Data";
+
+        cas.store_file("immutable.txt", data);
+
+        // 저장된 파일은 변조 불가능해야 함
+        assert!(cas.is_immutable("immutable.txt"));
+    }
+
+    #[test]
+    fn test_integrity_verification() {
+        let mut cas = CASCore::new();
+        let data = b"Verify Me Please";
+
+        let (hash, _) = cas.store_file("verify.txt", data);
+        assert!(cas.verify_file(&hash));
+    }
+
+    #[test]
+    fn test_deduplication() {
+        let mut cas = CASCore::new();
+        let data = b"Duplicate Data Pattern";
+
+        cas.store_file("file1.txt", data);
+        cas.store_file("file2.txt", data);
+
+        let stats = cas.storage_stats();
+        assert!(stats.deduplication_rate > 0.0);
+    }
+
+    #[test]
+    fn test_list_files() {
+        let mut cas = CASCore::new();
+
+        cas.store_file("file1.txt", b"Data 1");
+        cas.store_file("file2.txt", b"Data 2");
+        cas.store_file("file3.txt", b"Data 3");
+
+        let files = cas.list_files();
+        assert_eq!(files.len(), 3);
+        assert!(files.contains(&"file1.txt".to_string()));
+    }
+
+    #[test]
+    fn test_file_info() {
+        let mut cas = CASCore::new();
+        let data = b"File Info Test";
+
+        cas.store_file("info.txt", data);
+        let info = cas.file_info("info.txt").unwrap();
+
+        assert_eq!(info.size, data.len());
+        assert!(info.chunks > 0);
+        assert!(info.immutable);
+    }
+
+    #[test]
+    fn test_cas_statistics() {
+        let mut cas = CASCore::new();
+
+        cas.store_file("file1.txt", b"Data A");
+        cas.store_file("file2.txt", b"Data B");
+
+        let stats = cas.storage_stats();
+        assert_eq!(stats.total_files, 2);
+        assert!(stats.stored_bytes > 0);
+    }
+
+    #[test]
+    fn test_multiple_files_different_data() {
+        let mut cas = CASCore::new();
+
+        cas.store_file("a.txt", &[0xAA; 2000]);
+        cas.store_file("b.txt", &[0xBB; 2000]);
+        cas.store_file("c.txt", &[0xCC; 2000]);
+
+        assert_eq!(cas.list_files().len(), 3);
+        assert!(cas.verify_by_name("a.txt"));
+        assert!(cas.verify_by_name("b.txt"));
+        assert!(cas.verify_by_name("c.txt"));
+    }
+
+    #[test]
+    fn test_hash_immutability() {
+        let mut cas = CASCore::new();
+        let data = b"Same Data";
+
+        let (hash1, _) = cas.store_file("file1.txt", data);
+        let (hash2, _) = cas.store_file("file2.txt", data);
+
+        // 같은 데이터 = 같은 해시
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_avalanche_effect_on_files() {
+        let mut cas = CASCore::new();
+
+        let (hash1, _) = cas.store_file("file1.txt", b"Original");
+        let (hash2, _) = cas.store_file("file2.txt", b"Modified");
+
+        // 다른 데이터 = 다른 해시
+        assert_ne!(hash1, hash2);
+    }
+}

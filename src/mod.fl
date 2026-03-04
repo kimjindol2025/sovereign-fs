@@ -1,0 +1,28 @@
+// Sovereign-FS: 무결성 분산 파일 시스템
+// Challenge 8: Content-Addressable Storage with Predictive Prefetching
+
+pub mod cas;
+pub mod dedup;
+pub mod integrity;
+pub mod predictor;
+pub mod cache;
+
+pub use cas::*;
+
+// Phase 1: CAS 완료
+// Phase 2: 중복 제거 + 무결성 검증 (진행 예정)
+// Phase 3: 예측 모델 (L0NN) (진행 예정)
+// Phase 4: DMA 캐시 관리 (진행 예정)
+// Phase 5: 통합 (진행 예정)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_module_structure() {
+        let phase1 = Phase1CAS::new();
+        let status = phase1.status();
+        assert_eq!(status.files_stored, 0);
+    }
+}
