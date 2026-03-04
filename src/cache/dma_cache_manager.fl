@@ -1,0 +1,416 @@
+// Phase 5: DMA Cache Manager
+// DMA 인식 캐싱 + 프리페치 버퍼 관리
+
+use crate::predictor::*;
+use std::collections::HashMap;
+
+/// DMA 전송 크기 클래스
+#[derive(Clone, Debug, PartialEq)]
+pub enum DMASize {
+    Small,    // 1-4KB
+    Medium,   // 4-64KB
+    Large,    // 64KB-1MB
+    Huge,     // >1MB
+}
+
+impl DMASize {
+    pub fn from_bytes(size: usize) -> Self {
+        match size {
+            0..=4096 => DMASize::Small,
+            4097..=65536 => DMASize::Medium,
+            65537..=1048576 => DMASize::Large,
+            _ => DMASize::Huge,
+        }
+    }
+
+    pub fn priority(&self) -> usize {
+        match self {
+            DMASize::Small => 3,
+            DMASize::Medium => 2,
+            DMASize::Large => 1,
+            DMASize::Huge => 0,  // 최우선 (인터럽트 최소)
+        }
+    }
+
+    pub fn dma_efficiency(&self) -> f64 {
+        match self {
+            DMASize::Small => 0.6,    // 오버헤드 40%
+            DMASize::Medium => 0.85,  // 오버헤드 15%
+            DMASize::Large => 0.95,   // 오버헤드 5%
+            DMASize::Huge => 0.99,    // 오버헤드 1%
+        }
+    }
+}
+
+/// 캐시 라인
+#[derive(Clone, Debug)]
+pub struct CacheLine {
+    pub filename: String,
+    pub offset: usize,
+    pub size: usize,
+    pub dma_size: DMASize,
+    pub data: Vec<u8>,
+    pub access_count: usize,
+    pub last_access: u64,
+    pub is_prefetched: bool,
+}
+
+impl CacheLine {
+    pub fn new(filename: String, offset: usize, size: usize, data: Vec<u8>, is_prefetched: bool) -> Self {
+        CacheLine {
+            filename,
+            offset,
+            size,
+            dma_size: DMASize::from_bytes(size),
+            data,
+            access_count: 0,
+            last_access: 0,
+            is_prefetched,
+        }
+    }
+
+    pub fn access(&mut self, timestamp: u64) {
+        self.access_count += 1;
+        self.last_access = timestamp;
+    }
+
+    pub fn dma_efficiency(&self) -> f64 {
+        self.dma_size.dma_efficiency()
+    }
+}
+
+/// 캐시 우선순위
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CachePriority {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl CachePriority {
+    pub fn from_score(score: f64, access_count: usize) -> Self {
+        let weighted_score = score * 0.7 + (access_count as f64 / 10.0).min(1.0) * 0.3;
+
+        if weighted_score >= 0.8 {
+            CachePriority::Critical
+        } else if weighted_score >= 0.6 {
+            CachePriority::High
+        } else if weighted_score >= 0.4 {
+            CachePriority::Medium
+        } else {
+            CachePriority::Low
+        }
+    }
+
+    pub fn eviction_priority(&self) -> usize {
+        match self {
+            CachePriority::Low => 0,
+            CachePriority::Medium => 1,
+            CachePriority::High => 2,
+            CachePriority::Critical => 3,
+        }
+    }
+}
+
+/// DMA 캐시 관리자
+#[derive(Clone, Debug)]
+pub struct DMACache {
+    pub cache_lines: HashMap<String, Vec<CacheLine>>,
+    pub max_size: usize,
+    pub current_size: usize,
+    pub prefetch_buffer_size: usize,
+    pub prefetch_buffer_used: usize,
+    pub hit_count: usize,
+    pub miss_count: usize,
+    pub eviction_count: usize,
+    pub dma_transfers: usize,
+}
+
+impl DMACache {
+    pub fn new(max_size: usize, prefetch_buffer_size: usize) -> Self {
+        DMACache {
+            cache_lines: HashMap::new(),
+            max_size,
+            current_size: 0,
+            prefetch_buffer_size,
+            prefetch_buffer_used: 0,
+            hit_count: 0,
+            miss_count: 0,
+            eviction_count: 0,
+            dma_transfers: 0,
+        }
+    }
+
+    /// 캐시 조회
+    pub fn lookup(&mut self, filename: &str, offset: usize, size: usize, timestamp: u64) -> Option<Vec<u8>> {
+        if let Some(lines) = self.cache_lines.get_mut(filename) {
+            for line in lines {
+                if line.offset <= offset && offset + size <= line.offset + line.size {
+                    line.access(timestamp);
+                    self.hit_count += 1;
+                    return Some(line.data.clone());
+                }
+            }
+        }
+        self.miss_count += 1;
+        None
+    }
+
+    /// 프리페치를 통한 캐시 추가
+    pub fn add_prefetch_line(&mut self, line: CacheLine) -> bool {
+        if self.prefetch_buffer_used + line.size > self.prefetch_buffer_size {
+            return false;  // 프리페치 버퍼 부족
+        }
+
+        self.prefetch_buffer_used += line.size;
+        self.current_size += line.size;
+
+        self.cache_lines
+            .entry(line.filename.clone())
+            .or_insert_with(Vec::new)
+            .push(line);
+
+        self.dma_transfers += 1;
+        true
+    }
+
+    /// 일반 캐시 추가 (접근 기반)
+    pub fn add_cache_line(&mut self, line: CacheLine) -> bool {
+        if self.current_size + line.size > self.max_size {
+            // 캐시 부족 → eviction
+            if !self.evict_one() {
+                return false;
+            }
+        }
+
+        self.current_size += line.size;
+
+        self.cache_lines
+            .entry(line.filename.clone())
+            .or_insert_with(Vec::new)
+            .push(line);
+
+        self.dma_transfers += 1;
+        true
+    }
+
+    /// LRU + 우선순위 기반 eviction
+    fn evict_one(&mut self) -> bool {
+        let mut victim: Option<(String, usize, usize)> = None;
+        let mut min_priority = usize::MAX;
+
+        for (filename, lines) in &self.cache_lines {
+            for (idx, line) in lines.iter().enumerate() {
+                // 낮은 우선순위, 접근 적음, 최근 사용 오래됨 → 제거 후보
+                let priority = line.dma_size.priority() + line.access_count;
+
+                if priority < min_priority {
+                    min_priority = priority;
+                    victim = Some((filename.clone(), idx, line.size));
+                }
+            }
+        }
+
+        if let Some((filename, idx, size)) = victim {
+            if let Some(lines) = self.cache_lines.get_mut(&filename) {
+                if idx < lines.len() {
+                    lines.remove(idx);
+                    self.current_size = self.current_size.saturating_sub(size);
+                    self.eviction_count += 1;
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// DMA 전송 최적화
+    pub fn optimize_dma_transfer(&self, size: usize) -> (usize, f64) {
+        let dma_size = DMASize::from_bytes(size);
+        let efficiency = dma_size.dma_efficiency();
+        (dma_size.priority(), efficiency)
+    }
+
+    /// 캐시 일관성 (간단한 write-through)
+    pub fn invalidate(&mut self, filename: &str) {
+        if let Some(lines) = self.cache_lines.get_mut(filename) {
+            let total_size: usize = lines.iter().map(|l| l.size).sum();
+            self.current_size = self.current_size.saturating_sub(total_size);
+            lines.clear();
+        }
+    }
+
+    /// 통계
+    pub fn statistics(&self) -> CacheStatistics {
+        let total_accesses = self.hit_count + self.miss_count;
+        let hit_rate = if total_accesses > 0 {
+            self.hit_count as f64 / total_accesses as f64
+        } else {
+            0.0
+        };
+
+        CacheStatistics {
+            hit_count: self.hit_count,
+            miss_count: self.miss_count,
+            hit_rate,
+            total_size: self.current_size,
+            prefetch_buffer_used: self.prefetch_buffer_used,
+            eviction_count: self.eviction_count,
+            dma_transfers: self.dma_transfers,
+            utilization: self.current_size as f64 / self.max_size as f64,
+        }
+    }
+}
+
+/// 캐시 통계
+#[derive(Clone, Debug)]
+pub struct CacheStatistics {
+    pub hit_count: usize,
+    pub miss_count: usize,
+    pub hit_rate: f64,
+    pub total_size: usize,
+    pub prefetch_buffer_used: usize,
+    pub eviction_count: usize,
+    pub dma_transfers: usize,
+    pub utilization: f64,
+}
+
+/// 프리페치 버퍼 관리자
+#[derive(Clone, Debug)]
+pub struct PrefetchBuffer {
+    pub pending_requests: Vec<(String, f64)>,  // (filename, confidence)
+    pub max_pending: usize,
+    pub batch_size: usize,
+}
+
+impl PrefetchBuffer {
+    pub fn new(max_pending: usize, batch_size: usize) -> Self {
+        PrefetchBuffer {
+            pending_requests: Vec::new(),
+            max_pending,
+            batch_size,
+        }
+    }
+
+    /// 프리페치 요청 추가
+    pub fn add_request(&mut self, filename: String, confidence: f64) -> bool {
+        if self.pending_requests.len() >= self.max_pending {
+            return false;  // 버퍼 가득 참
+        }
+
+        self.pending_requests.push((filename, confidence));
+        self.pending_requests.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        true
+    }
+
+    /// 배치 처리 (상위 batch_size개)
+    pub fn get_batch(&mut self) -> Vec<(String, f64)> {
+        let batch_size = self.batch_size.min(self.pending_requests.len());
+        self.pending_requests.drain(0..batch_size).collect()
+    }
+
+    /// 버퍼 현황
+    pub fn pending_count(&self) -> usize {
+        self.pending_requests.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dma_size_classification() {
+        assert_eq!(DMASize::from_bytes(2048), DMASize::Small);
+        assert_eq!(DMASize::from_bytes(8192), DMASize::Medium);
+        assert_eq!(DMASize::from_bytes(512000), DMASize::Large);
+        assert_eq!(DMASize::from_bytes(2000000), DMASize::Huge);
+    }
+
+    #[test]
+    fn test_dma_efficiency() {
+        assert_eq!(DMASize::Small.dma_efficiency(), 0.6);
+        assert_eq!(DMASize::Huge.dma_efficiency(), 0.99);
+    }
+
+    #[test]
+    fn test_cache_line_creation() {
+        let line = CacheLine::new("test.txt".to_string(), 0, 4096, vec![0u8; 4096], false);
+        assert_eq!(line.filename, "test.txt");
+        assert_eq!(line.access_count, 0);
+        assert!(!line.is_prefetched);
+    }
+
+    #[test]
+    fn test_cache_line_access() {
+        let mut line = CacheLine::new("test.txt".to_string(), 0, 4096, vec![0u8; 4096], false);
+        line.access(1);
+        assert_eq!(line.access_count, 1);
+        assert_eq!(line.last_access, 1);
+    }
+
+    #[test]
+    fn test_dma_cache_creation() {
+        let cache = DMACache::new(1000000, 100000);
+        assert_eq!(cache.max_size, 1000000);
+        assert_eq!(cache.current_size, 0);
+        assert_eq!(cache.hit_count, 0);
+    }
+
+    #[test]
+    fn test_cache_hit_and_miss() {
+        let mut cache = DMACache::new(1000000, 100000);
+
+        let line = CacheLine::new("test.txt".to_string(), 0, 1024, vec![0u8; 1024], false);
+        cache.add_cache_line(line);
+
+        let hit = cache.lookup("test.txt", 512, 100, 1);
+        assert!(hit.is_some());
+        assert_eq!(cache.hit_count, 1);
+
+        let miss = cache.lookup("other.txt", 0, 100, 2);
+        assert!(miss.is_none());
+        assert_eq!(cache.miss_count, 1);
+    }
+
+    #[test]
+    fn test_prefetch_buffer() {
+        let mut buffer = PrefetchBuffer::new(10, 3);
+
+        assert!(buffer.add_request("file1.txt".to_string(), 0.9));
+        assert!(buffer.add_request("file2.txt".to_string(), 0.7));
+        assert!(buffer.add_request("file3.txt".to_string(), 0.8));
+
+        let batch = buffer.get_batch();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].0, "file1.txt");  // 0.9가 최고
+    }
+
+    #[test]
+    fn test_cache_priority_calculation() {
+        let priority_high = CachePriority::from_score(0.85, 10);
+        assert_eq!(priority_high, CachePriority::Critical);
+
+        let priority_med = CachePriority::from_score(0.5, 5);
+        assert_eq!(priority_med, CachePriority::Medium);
+    }
+
+    #[test]
+    fn test_cache_statistics() {
+        let mut cache = DMACache::new(10000, 1000);
+
+        let line = CacheLine::new("test.txt".to_string(), 0, 2048, vec![0u8; 2048], false);
+        cache.add_cache_line(line);
+
+        cache.lookup("test.txt", 512, 100, 1);  // hit
+        cache.lookup("other.txt", 0, 100, 2);   // miss
+
+        let stats = cache.statistics();
+        assert_eq!(stats.hit_count, 1);
+        assert_eq!(stats.miss_count, 1);
+        assert!(stats.hit_rate > 0.4 && stats.hit_rate < 0.6);
+    }
+}

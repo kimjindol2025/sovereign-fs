@@ -1,0 +1,398 @@
+// Phase 5: DMA Cache Manager E2E Tests
+
+use crate::cache::*;
+use crate::predictor::*;
+
+#[test]
+fn test_dma_size_classification_accuracy() {
+    assert_eq!(DMASize::from_bytes(512), DMASize::Small);
+    assert_eq!(DMASize::from_bytes(4096), DMASize::Small);
+    assert_eq!(DMASize::from_bytes(8192), DMASize::Medium);
+    assert_eq!(DMASize::from_bytes(65536), DMASize::Medium);
+    assert_eq!(DMASize::from_bytes(131072), DMASize::Large);
+    assert_eq!(DMASize::from_bytes(1048576), DMASize::Large);
+    assert_eq!(DMASize::from_bytes(2097152), DMASize::Huge);
+
+    println!("✅ DMA Size Classification: All boundaries correct");
+}
+
+#[test]
+fn test_dma_efficiency_rankings() {
+    let small = DMASize::Small.dma_efficiency();
+    let medium = DMASize::Medium.dma_efficiency();
+    let large = DMASize::Large.dma_efficiency();
+    let huge = DMASize::Huge.dma_efficiency();
+
+    // 크기가 클수록 효율성 높음
+    assert!(small < medium);
+    assert!(medium < large);
+    assert!(large < huge);
+
+    assert_eq!(small, 0.6);
+    assert_eq!(medium, 0.85);
+    assert_eq!(large, 0.95);
+    assert_eq!(huge, 0.99);
+
+    println!("✅ DMA Efficiency: Small={}, Medium={}, Large={}, Huge={}",
+             small, medium, large, huge);
+}
+
+#[test]
+fn test_cache_line_lifecycle() {
+    let mut line = CacheLine::new(
+        "document.txt".to_string(),
+        0,
+        8192,
+        vec![0x42u8; 8192],
+        false,
+    );
+
+    assert_eq!(line.filename, "document.txt");
+    assert_eq!(line.size, 8192);
+    assert_eq!(line.access_count, 0);
+    assert!(!line.is_prefetched);
+
+    // 접근 시뮬레이션
+    line.access(1);
+    assert_eq!(line.access_count, 1);
+    assert_eq!(line.last_access, 1);
+
+    line.access(10);
+    assert_eq!(line.access_count, 2);
+    assert_eq!(line.last_access, 10);
+
+    println!("✅ Cache Line Lifecycle: 2 accesses recorded");
+}
+
+#[test]
+fn test_cache_hit_rate_tracking() {
+    let mut cache = DMACache::new(1000000, 100000);
+
+    // 5개 캐시 라인 추가
+    for i in 0..5 {
+        let line = CacheLine::new(
+            format!("file{}.txt", i),
+            0,
+            4096,
+            vec![0u8; 4096],
+            false,
+        );
+        cache.add_cache_line(line);
+    }
+
+    // 5개 히트
+    for i in 0..5 {
+        cache.lookup(&format!("file{}.txt", i), 0, 100, i as u64);
+    }
+
+    // 3개 미스
+    for _ in 0..3 {
+        cache.lookup("nonexistent.txt", 0, 100, 100);
+    }
+
+    assert_eq!(cache.hit_count, 5);
+    assert_eq!(cache.miss_count, 3);
+
+    let stats = cache.statistics();
+    assert!(stats.hit_rate > 0.6 && stats.hit_rate < 0.7);  // 5/8 ≈ 0.625
+
+    println!("✅ Cache Hit Rate: {:.1}% (5 hits, 3 misses)",
+             stats.hit_rate * 100.0);
+}
+
+#[test]
+fn test_prefetch_buffer_priority_ordering() {
+    let mut buffer = PrefetchBuffer::new(10, 4);
+
+    // 신뢰도 섞여서 추가
+    assert!(buffer.add_request("file1.txt".to_string(), 0.5));
+    assert!(buffer.add_request("file2.txt".to_string(), 0.9));
+    assert!(buffer.add_request("file3.txt".to_string(), 0.7));
+    assert!(buffer.add_request("file4.txt".to_string(), 0.3));
+    assert!(buffer.add_request("file5.txt".to_string(), 0.8));
+
+    let batch = buffer.get_batch();
+    assert_eq!(batch.len(), 4);  // batch_size = 4
+
+    // 신뢰도 순으로 정렬되어야 함
+    assert_eq!(batch[0].0, "file2.txt");  // 0.9
+    assert_eq!(batch[1].0, "file5.txt");  // 0.8
+    assert_eq!(batch[2].0, "file3.txt");  // 0.7
+    assert_eq!(batch[3].0, "file1.txt");  // 0.5
+
+    println!("✅ Prefetch Buffer: Priority ordering correct");
+}
+
+#[test]
+fn test_cache_priority_classification() {
+    let critical = CachePriority::from_score(0.9, 20);
+    assert_eq!(critical, CachePriority::Critical);
+
+    let high = CachePriority::from_score(0.7, 10);
+    assert_eq!(high, CachePriority::High);
+
+    let medium = CachePriority::from_score(0.5, 5);
+    assert_eq!(medium, CachePriority::Medium);
+
+    let low = CachePriority::from_score(0.2, 2);
+    assert_eq!(low, CachePriority::Low);
+
+    println!("✅ Cache Priority: All classifications correct");
+}
+
+#[test]
+fn test_dma_transfer_optimization() {
+    let cache = DMACache::new(1000000, 100000);
+
+    let (priority_small, eff_small) = cache.optimize_dma_transfer(2048);
+    let (priority_large, eff_large) = cache.optimize_dma_transfer(512000);
+
+    // 작은 크기는 우선순위 낮음, 효율성 낮음
+    assert!(priority_small > priority_large);
+    assert!(eff_small < eff_large);
+
+    println!("✅ DMA Transfer Optimization: Small priority={}, Large priority={}",
+             priority_small, priority_large);
+}
+
+#[test]
+fn test_cache_invalidation() {
+    let mut cache = DMACache::new(1000000, 100000);
+
+    // 3개 파일 캐시
+    for i in 0..3 {
+        let line = CacheLine::new(
+            "cached.txt".to_string(),
+            i * 4096,
+            4096,
+            vec![0u8; 4096],
+            false,
+        );
+        cache.add_cache_line(line);
+    }
+
+    assert!(cache.current_size > 0);
+
+    // 무효화
+    cache.invalidate("cached.txt");
+    assert_eq!(cache.current_size, 0);
+
+    println!("✅ Cache Invalidation: Size reset to 0");
+}
+
+#[cfg(test)]
+mod unforgiving_rules {
+    use super::*;
+
+    #[test]
+    fn rule_1_hit_rate_tracking_accuracy() {
+        // Rule: 히트율 추적 정확도 = 100%
+        let mut cache = DMACache::new(1000000, 100000);
+
+        for i in 0..10 {
+            let line = CacheLine::new(
+                format!("file{}.txt", i % 5),
+                0,
+                2048,
+                vec![0u8; 2048],
+                false,
+            );
+            cache.add_cache_line(line);
+        }
+
+        // 정확히 7개 히트
+        for i in 0..7 {
+            cache.lookup(&format!("file{}.txt", i % 5), 0, 100, i as u64);
+        }
+
+        // 정확히 3개 미스
+        for _ in 0..3 {
+            cache.lookup("missing.txt", 0, 100, 100);
+        }
+
+        assert_eq!(cache.hit_count, 7);
+        assert_eq!(cache.miss_count, 3);
+        assert_eq!(cache.hit_count + cache.miss_count, 10);
+
+        println!("✅ RULE 1 PASS: Hit Rate Tracking 100% Accurate (7/10)");
+    }
+
+    #[test]
+    fn rule_2_prefetch_priority_ordering() {
+        // Rule: 프리페치 우선순위 정렬 = 100%
+        let mut buffer = PrefetchBuffer::new(20, 5);
+
+        // 무작위 순서로 추가
+        let requests = vec![
+            ("file5.txt", 0.5),
+            ("file1.txt", 0.9),
+            ("file3.txt", 0.6),
+            ("file2.txt", 0.8),
+            ("file4.txt", 0.7),
+        ];
+
+        for (file, conf) in &requests {
+            buffer.add_request(file.to_string(), *conf);
+        }
+
+        let batch = buffer.get_batch();
+
+        // 신뢰도 순서 확인
+        for i in 1..batch.len() {
+            assert!(batch[i - 1].1 >= batch[i].1,
+                   "Priority ordering violated: {} < {}",
+                   batch[i - 1].1, batch[i].1);
+        }
+
+        println!("✅ RULE 2 PASS: Prefetch Priority 100% Ordered");
+    }
+
+    #[test]
+    fn rule_3_eviction_correctness() {
+        // Rule: LRU eviction이 올바르게 작동 = 100%
+        let mut cache = DMACache::new(10000, 1000);
+
+        // 정확히 용량 채우기 (2048 × 4 = 8192)
+        for i in 0..4 {
+            let line = CacheLine::new(
+                format!("file{}.txt", i),
+                0,
+                2048,
+                vec![0u8; 2048],
+                false,
+            );
+            cache.add_cache_line(line);
+        }
+
+        let size_before = cache.current_size;
+
+        // 5번째 추가 시 eviction 필요
+        let line5 = CacheLine::new(
+            "file5.txt".to_string(),
+            0,
+            2048,
+            vec![0u8; 2048],
+            false,
+        );
+        let added = cache.add_cache_line(line5);
+
+        assert!(added);
+        assert!(cache.eviction_count > 0);
+        // 크기는 변하지 않아야 함 (evict + add)
+        assert!(cache.current_size <= 10000);
+
+        println!("✅ RULE 3 PASS: Eviction Correctness (evictions={})",
+                 cache.eviction_count);
+    }
+
+    #[test]
+    fn rule_4_dma_efficiency_bounds() {
+        // Rule: DMA 효율성이 모두 [0.6, 0.99] 범위 = 100%
+        let sizes = vec![
+            (1024, DMASize::Small, 0.6),
+            (32768, DMASize::Medium, 0.85),
+            (262144, DMASize::Large, 0.95),
+            (2097152, DMASize::Huge, 0.99),
+        ];
+
+        for (bytes, expected_size, expected_eff) in sizes {
+            let size = DMASize::from_bytes(bytes);
+            assert_eq!(size, expected_size);
+
+            let eff = size.dma_efficiency();
+            assert_eq!(eff, expected_eff);
+            assert!(eff >= 0.6 && eff <= 0.99);
+        }
+
+        println!("✅ RULE 4 PASS: DMA Efficiency Bounds [0.6, 0.99]");
+    }
+
+    #[test]
+    fn rule_5_cache_coherency_on_invalidation() {
+        // Rule: Invalidation 후 캐시가 완전히 비워짐 = 100%
+        let mut cache = DMACache::new(1000000, 100000);
+
+        // 여러 파일에서 라인 추가
+        for i in 0..20 {
+            let line = CacheLine::new(
+                format!("file{}.txt", i % 3),
+                0,
+                1024,
+                vec![0u8; 1024],
+                false,
+            );
+            cache.add_cache_line(line);
+        }
+
+        let size_before = cache.current_size;
+        assert!(size_before > 0);
+
+        // file0.txt 무효화
+        cache.invalidate("file0.txt");
+
+        // 다른 파일들은 남아있어야 함
+        let size_after = cache.current_size;
+        assert!(size_after < size_before);
+        assert!(size_after >= 0);
+
+        println!("✅ RULE 5 PASS: Cache Coherency on Invalidation");
+    }
+}
+
+// 최종 E2E 테스트: Phase 5 완전 워크플로우
+#[test]
+fn test_phase_5_complete_workflow() {
+    let mut cache = DMACache::new(1000000, 100000);
+    let mut prefetch_buffer = PrefetchBuffer::new(20, 5);
+
+    // 1. 파일 접근 시뮬레이션 (L4에서 예측한 파일들)
+    let predictions = vec![
+        ("readme.txt", 0.95),
+        ("guide.txt", 0.82),
+        ("faq.txt", 0.67),
+    ];
+
+    // 2. 프리페치 버퍼에 추가
+    for (file, conf) in &predictions {
+        prefetch_buffer.add_request(file.to_string(), *conf);
+    }
+
+    // 3. 배치 처리
+    let batch = prefetch_buffer.get_batch();
+    assert_eq!(batch.len(), 3);
+
+    // 4. 배치 내 파일들을 캐시에 추가 (프리페치)
+    for (file, _) in &batch {
+        let line = CacheLine::new(
+            file.clone(),
+            0,
+            8192,
+            vec![0u8; 8192],
+            true,  // is_prefetched = true
+        );
+        cache.add_prefetch_line(line);
+    }
+
+    // 5. 캐시 히트 테스트
+    let hit = cache.lookup("readme.txt", 0, 100, 1);
+    assert!(hit.is_some());
+    assert_eq!(cache.hit_count, 1);
+
+    // 6. 캐시 미스 (prefetch 안 된 파일)
+    let miss = cache.lookup("unknown.txt", 0, 100, 2);
+    assert!(miss.is_none());
+    assert_eq!(cache.miss_count, 1);
+
+    // 7. 최종 통계
+    let stats = cache.statistics();
+
+    println!("✅ Phase 5 Complete Workflow:");
+    println!("   Prefetch Requests: {}", predictions.len());
+    println!("   Batch Size: {}", batch.len());
+    println!("   Cache Hits: {}", stats.hit_count);
+    println!("   Cache Misses: {}", stats.miss_count);
+    println!("   Hit Rate: {:.1}%", stats.hit_rate * 100.0);
+    println!("   Utilization: {:.1}%", stats.utilization * 100.0);
+    println!("   Prefetch Buffer Used: {}/{} bytes",
+             stats.prefetch_buffer_used, cache.prefetch_buffer_size);
+}

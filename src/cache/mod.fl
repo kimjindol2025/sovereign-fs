@@ -1,15 +1,21 @@
 // Phase 5: DMA Cache Manager
-// DMA 캐시 관리 및 최적화 (향후 구현)
+// DMA 인식 캐싱 + 프리페치 버퍼 관리
 
-// 계획:
-// - DMA-aware Caching Strategy
-// - Prefetch Buffer Management
-// - Cache Coherency Maintenance
+pub mod dma_cache_manager;
+
+pub use dma_cache_manager::{
+    DMASize, CacheLine, CachePriority, DMACache,
+    CacheStatistics, PrefetchBuffer,
+};
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn test_phase_5_placeholder() {
-        // Phase 5 구현 예정
+    fn test_cache_module_exports() {
+        let cache = DMACache::new(1000000, 100000);
+        let stats = cache.statistics();
+        assert_eq!(stats.hit_count, 0);
     }
 }
