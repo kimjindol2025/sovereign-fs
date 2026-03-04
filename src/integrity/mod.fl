@@ -1,10 +1,16 @@
-// Phase 2: Integrity Verification Module
+// Phase 2-3: Integrity Verification Module
 
 pub mod integrity_checker;
+pub mod realtime_monitor;
 
 pub use integrity_checker::{
     IntegrityChecker, IntegrityReport, IntegrityStatus,
     ChunkStatus, ConsistencySnapshot, IntegrityStats,
+};
+
+pub use realtime_monitor::{
+    RealtimeMonitor, MonitoringEvent, RecoveryStrategy,
+    RecoveryResult, MonitoringStats,
 };
 
 #[cfg(test)]

@@ -1,0 +1,379 @@
+// Phase 3: Real-time Integrity Monitoring E2E Tests
+
+use crate::cas::*;
+use crate::dedup::*;
+use crate::integrity::*;
+use std::collections::HashMap;
+
+#[test]
+fn test_realtime_monitor_creation() {
+    let monitor = RealtimeMonitor::new();
+    assert_eq!(monitor.total_accesses, 0);
+    assert_eq!(monitor.total_corruptions_detected, 0);
+    assert_eq!(monitor.total_recoveries, 0);
+    assert!(monitor.auto_recovery_enabled);
+    println!("✅ Monitor Creation: OK");
+}
+
+#[test]
+fn test_access_recording_and_verification_interval() {
+    let mut monitor = RealtimeMonitor::new();
+
+    // 처음 5회 접근: 검증 필요 없음 (기본값=10)
+    for i in 0..5 {
+        let needs_verify = monitor.record_access("file.txt");
+        assert!(!needs_verify);
+    }
+
+    // 6-9회 접근: 여전히 필요 없음
+    for _ in 0..4 {
+        let needs_verify = monitor.record_access("file.txt");
+        assert!(!needs_verify);
+    }
+
+    // 10회: 검증 필요
+    let needs_verify = monitor.record_access("file.txt");
+    assert!(needs_verify);
+
+    let stats = monitor.monitoring_stats();
+    assert_eq!(stats.total_accesses, 10);
+    println!("✅ Access Recording & Verification Interval: 10 accesses correctly triggers verification");
+}
+
+#[test]
+fn test_access_patterns_sorting() {
+    let mut monitor = RealtimeMonitor::new();
+
+    // 파일1: 15회 접근
+    for _ in 0..15 {
+        monitor.record_access("file1.txt");
+    }
+
+    // 파일2: 8회 접근
+    for _ in 0..8 {
+        monitor.record_access("file2.txt");
+    }
+
+    // 파일3: 22회 접근
+    for _ in 0..22 {
+        monitor.record_access("file3.txt");
+    }
+
+    let patterns = monitor.access_patterns();
+    assert_eq!(patterns.len(), 3);
+    assert_eq!(patterns[0].0, "file3.txt");
+    assert_eq!(patterns[0].1, 22);
+    assert_eq!(patterns[1].0, "file1.txt");
+    assert_eq!(patterns[2].0, "file2.txt");
+    println!("✅ Access Patterns: Correctly sorted by frequency");
+}
+
+#[test]
+fn test_monitoring_event_log_completeness() {
+    let mut monitor = RealtimeMonitor::new();
+
+    // 접근 이벤트
+    monitor.record_access("test.txt");
+
+    let log = monitor.get_event_log();
+    assert!(!log.is_empty());
+
+    // 이벤트 타입 확인
+    let has_access_event = log.iter().any(|(_, event)| {
+        matches!(event, MonitoringEvent::FileAccessed(_))
+    });
+    assert!(has_access_event);
+
+    println!("✅ Event Log: FileAccessed event recorded");
+}
+
+#[test]
+fn test_recovery_attempt_and_tracking() {
+    let mut monitor = RealtimeMonitor::new();
+    let engine = HashEngine::new();
+    let mut store = ChunkStore::new();
+
+    // 파일 저장
+    let data = b"Recovery Test Data";
+    store.store_chunked(data);
+
+    let manifest = FileManifest {
+        file_hash: engine.sha256(data),
+        chunk_hashes: vec![engine.sha256(data)],
+        file_size: data.len(),
+        stored_timestamp: 1,
+        immutable: true,
+    };
+
+    // 복구 시도
+    let result = monitor.attempt_recovery("test.txt", &manifest, &store);
+    assert!(result.success);
+    assert_eq!(result.strategy, RecoveryStrategy::Reconstruct);
+    assert_eq!(result.filename, "test.txt");
+
+    let stats = monitor.monitoring_stats();
+    assert_eq!(stats.total_recoveries, 1);
+    assert_eq!(stats.successful_recoveries, 1);
+    assert!(stats.recovery_success_rate > 0.99);
+
+    println!("✅ Recovery Attempt: Success rate = {:.0}%", stats.recovery_success_rate * 100.0);
+}
+
+#[test]
+fn test_background_verification_cycle() {
+    let mut monitor = RealtimeMonitor::new();
+    let engine = HashEngine::new();
+    let mut store = ChunkStore::new();
+    let mut manifests = HashMap::new();
+
+    // 3개 파일 저장
+    for i in 0..3 {
+        let data = format!("File {}", i).as_bytes().to_vec();
+        store.store_chunked(&data);
+
+        let manifest = FileManifest {
+            file_hash: engine.sha256(&data),
+            chunk_hashes: vec![engine.sha256(&data)],
+            file_size: data.len(),
+            stored_timestamp: i as u64,
+            immutable: true,
+        };
+        manifests.insert(format!("file{}.txt", i), manifest);
+    }
+
+    // 백그라운드 검증
+    let results = monitor.background_verification(&manifests, &store);
+    assert!(!results.is_empty());
+
+    let valid_count = results.iter().filter(|s| *s == &IntegrityStatus::Valid).count();
+    assert_eq!(valid_count, results.len());
+
+    println!("✅ Background Verification: {} files verified", results.len());
+}
+
+#[test]
+fn test_monitoring_stats_comprehensive() {
+    let mut monitor = RealtimeMonitor::new();
+    let engine = HashEngine::new();
+    let mut store = ChunkStore::new();
+
+    // 데이터 저장
+    let data = b"Stats Test";
+    store.store_chunked(data);
+
+    let manifest = FileManifest {
+        file_hash: engine.sha256(data),
+        chunk_hashes: vec![engine.sha256(data)],
+        file_size: data.len(),
+        stored_timestamp: 1,
+        immutable: true,
+    };
+
+    // 8회 접근
+    for _ in 0..8 {
+        monitor.record_access("file.txt");
+    }
+
+    let stats = monitor.monitoring_stats();
+    assert_eq!(stats.total_accesses, 8);
+    assert_eq!(stats.corruptions_detected, 0);
+    assert_eq!(stats.total_recoveries, 0);
+    assert_eq!(stats.corruption_rate, 0.0);
+
+    println!("✅ Monitoring Stats: total_accesses={}, corruption_rate={:.2}%",
+             stats.total_accesses, stats.corruption_rate * 100.0);
+}
+
+#[cfg(test)]
+mod unforgiving_rules {
+    use super::*;
+
+    #[test]
+    fn rule_1_access_counting_accuracy() {
+        // Rule: 접근 카운팅 정확도 = 100%
+        let mut monitor = RealtimeMonitor::new();
+
+        for i in 0..100 {
+            monitor.record_access(&format!("file{}.txt", i % 10));
+        }
+
+        let stats = monitor.monitoring_stats();
+        assert_eq!(stats.total_accesses, 100);
+
+        // 각 파일별 접근 횟수 확인
+        let patterns = monitor.access_patterns();
+        let total_pattern_counts: usize = patterns.iter().map(|(_, count)| *count).sum();
+        assert_eq!(total_pattern_counts, 100);
+
+        println!("✅ RULE 1 PASS: Access Counting 100% Accurate ({})", stats.total_accesses);
+    }
+
+    #[test]
+    fn rule_2_recovery_success_tracking() {
+        // Rule: 복구 성공률 추적 정확도 ≥ 98%
+        let mut monitor = RealtimeMonitor::new();
+        let engine = HashEngine::new();
+        let mut store = ChunkStore::new();
+
+        let data = b"Recovery Success Test";
+        store.store_chunked(data);
+
+        let manifest = FileManifest {
+            file_hash: engine.sha256(data),
+            chunk_hashes: vec![engine.sha256(data)],
+            file_size: data.len(),
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        // 10번 복구 시도
+        for i in 0..10 {
+            monitor.attempt_recovery(&format!("file{}.txt", i), &manifest, &store);
+        }
+
+        let stats = monitor.monitoring_stats();
+        assert_eq!(stats.total_recoveries, 10);
+        assert_eq!(stats.successful_recoveries, 10);
+        assert!(stats.recovery_success_rate >= 0.98);
+
+        println!("✅ RULE 2 PASS: Recovery Success Tracking {:.1}%", stats.recovery_success_rate * 100.0);
+    }
+
+    #[test]
+    fn rule_3_verification_interval_consistency() {
+        // Rule: 검증 간격 일관성 = 100% (항상 10회마다)
+        let mut monitor = RealtimeMonitor::new();
+
+        let mut verification_counts = Vec::new();
+        let mut access_count = 0;
+
+        for file_num in 0..50 {
+            let filename = format!("file{}.txt", file_num);
+            let mut file_access_count = 0;
+
+            for _ in 0..15 {
+                let needs_verify = monitor.record_access(&filename);
+                access_count += 1;
+                file_access_count += 1;
+
+                if needs_verify {
+                    verification_counts.push(file_access_count);
+                }
+            }
+        }
+
+        // 모든 검증이 정확히 10번 접근마다 발생했는지 확인
+        for count in &verification_counts {
+            assert_eq!(*count, 10);
+        }
+
+        println!("✅ RULE 3 PASS: Verification Interval 100% Consistent (every 10 accesses)");
+    }
+
+    #[test]
+    fn rule_4_event_logging_completeness() {
+        // Rule: 이벤트 로깅 완성도 = 100%
+        // 접근 → 검증 → 복구의 모든 이벤트가 기록되는가?
+        let mut monitor = RealtimeMonitor::new();
+        let engine = HashEngine::new();
+        let mut store = ChunkStore::new();
+
+        let data = b"Event Logging Test";
+        store.store_chunked(data);
+
+        let manifest = FileManifest {
+            file_hash: engine.sha256(data),
+            chunk_hashes: vec![engine.sha256(data)],
+            file_size: data.len(),
+            stored_timestamp: 1,
+            immutable: true,
+        };
+
+        // 접근 기록
+        for _ in 0..10 {
+            monitor.record_access("test.txt");
+        }
+
+        // 복구 기록
+        monitor.attempt_recovery("test.txt", &manifest, &store);
+
+        let log = monitor.get_event_log();
+
+        // 이벤트 타입 확인
+        let access_events = log.iter().filter(|(_, e)| matches!(e, MonitoringEvent::FileAccessed(_))).count();
+        let recovery_started = log.iter().any(|(_, e)| matches!(e, MonitoringEvent::RecoveryStarted(_)));
+        let recovery_completed = log.iter().any(|(_, e)| matches!(e, MonitoringEvent::RecoveryCompleted(_)));
+
+        assert!(access_events >= 10);
+        assert!(recovery_started);
+        assert!(recovery_completed);
+
+        println!("✅ RULE 4 PASS: Event Logging 100% Complete ({} events)", log.len());
+    }
+}
+
+// 최종 E2E 테스트: Phase 3 완전 워크플로우
+#[test]
+fn test_phase_3_complete_workflow() {
+    let mut cas = CASCore::new();
+    let mut monitor = RealtimeMonitor::new();
+    let engine = HashEngine::new();
+
+    // 1. 파일 저장 (CAS)
+    let files = vec![
+        ("readme.txt", b"# Sovereign-FS\n## Real-time Monitoring".as_ref()),
+        ("license.txt", b"MIT License\nCopyright 2026".as_ref()),
+        ("config.txt", b"[settings]\nmode=production".as_ref()),
+    ];
+
+    let mut manifests = HashMap::new();
+    let mut store = ChunkStore::new();
+
+    for (name, content) in &files {
+        let (hash, manifest) = cas.store_file(name, content);
+        manifests.insert(name.to_string(), manifest.clone());
+        store.store_chunked(content);
+    }
+
+    // 2. 접근 패턴 추적
+    for _ in 0..15 {
+        monitor.record_access("readme.txt");
+    }
+    for _ in 0..8 {
+        monitor.record_access("config.txt");
+    }
+    for _ in 0..3 {
+        monitor.record_access("license.txt");
+    }
+
+    // 3. 접근 통계 확인
+    let stats = monitor.monitoring_stats();
+    assert_eq!(stats.total_accesses, 26);
+    assert_eq!(stats.corruptions_detected, 0);
+
+    // 4. 접근 패턴 확인
+    let patterns = monitor.access_patterns();
+    assert_eq!(patterns[0].0, "readme.txt");
+    assert_eq!(patterns[0].1, 15);
+
+    // 5. 백그라운드 검증
+    let verification_results = monitor.background_verification(&manifests, &store);
+    let valid_count = verification_results.iter().filter(|s| *s == &IntegrityStatus::Valid).count();
+    assert_eq!(valid_count, 3);
+
+    // 6. 복구 이력 확인
+    let recovery_history = monitor.get_recovery_history();
+    // 아직 복구가 없어야 함
+    assert_eq!(recovery_history.len(), 0);
+
+    // 7. 이벤트 로그 확인
+    let event_log = monitor.get_event_log();
+    assert!(!event_log.is_empty());
+
+    println!("✅ Phase 3 Complete Workflow:");
+    println!("   Files Stored: {}", files.len());
+    println!("   Total Accesses: {}", stats.total_accesses);
+    println!("   Verified Files: {}/{}", valid_count, manifests.len());
+    println!("   Events Logged: {}", event_log.len());
+    println!("   Recovery Success Rate: {:.0}%", monitor.recovery_success_rate() * 100.0);
+}
