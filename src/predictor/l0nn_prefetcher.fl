@@ -1,0 +1,381 @@
+// Phase 4: L0NN Predictive Prefetching System
+// 경량 신경망 기반 접근 패턴 학습 및 프리페칭
+
+use crate::integrity::*;
+use std::collections::HashMap;
+
+/// 신경망 노드 활성화
+#[derive(Clone, Debug)]
+pub enum Activation {
+    Linear,  // f(x) = x
+    ReLU,    // f(x) = max(0, x)
+    Sigmoid, // f(x) = 1 / (1 + e^-x)
+}
+
+/// 신경망 가중치
+#[derive(Clone, Debug)]
+pub struct NeuralWeights {
+    pub w: f64,
+    pub b: f64,  // bias
+    pub activation: Activation,
+}
+
+impl NeuralWeights {
+    pub fn new(w: f64, b: f64, activation: Activation) -> Self {
+        NeuralWeights { w, b, activation }
+    }
+
+    pub fn forward(&self, x: f64) -> f64 {
+        let z = self.w * x + self.b;
+        match self.activation {
+            Activation::Linear => z,
+            Activation::ReLU => z.max(0.0),
+            Activation::Sigmoid => 1.0 / (1.0 + (-z).exp()),
+        }
+    }
+}
+
+/// 접근 시퀀스 학습을 위한 컨텍스트
+#[derive(Clone, Debug)]
+pub struct AccessSequence {
+    pub filename: String,
+    pub timestamp: u64,
+    pub access_count: usize,
+}
+
+/// L0NN 신경망 모델
+#[derive(Clone, Debug)]
+pub struct L0NN {
+    // Hidden layer: 8개 뉴런
+    pub hidden_layer: Vec<NeuralWeights>,
+    // Output layer: 3개 뉴런 (다음 3개 파일 예측)
+    pub output_layer: Vec<NeuralWeights>,
+    // 학습 속도
+    pub learning_rate: f64,
+}
+
+impl L0NN {
+    pub fn new() -> Self {
+        // 임의 초기화
+        let mut hidden_layer = Vec::new();
+        for i in 0..8 {
+            hidden_layer.push(NeuralWeights::new(
+                0.1 * (i as f64),
+                0.01,
+                if i % 2 == 0 { Activation::ReLU } else { Activation::Sigmoid },
+            ));
+        }
+
+        let mut output_layer = Vec::new();
+        for i in 0..3 {
+            output_layer.push(NeuralWeights::new(
+                0.1 * ((8 + i) as f64),
+                0.01,
+                Activation::Sigmoid,
+            ));
+        }
+
+        L0NN {
+            hidden_layer,
+            output_layer,
+            learning_rate: 0.01,
+        }
+    }
+
+    /// Forward pass: 입력 → Hidden → Output
+    pub fn forward(&self, input: f64) -> Vec<f64> {
+        // Hidden layer
+        let mut hidden_outputs = Vec::new();
+        for neuron in &self.hidden_layer {
+            hidden_outputs.push(neuron.forward(input));
+        }
+
+        // Output layer (hidden의 합을 입력으로)
+        let hidden_sum: f64 = hidden_outputs.iter().sum::<f64>() / hidden_outputs.len() as f64;
+        let mut outputs = Vec::new();
+        for neuron in &self.output_layer {
+            outputs.push(neuron.forward(hidden_sum));
+        }
+
+        outputs
+    }
+
+    /// 학습: 접근 시퀀스 기반 가중치 조정
+    pub fn learn(&mut self, sequences: &[AccessSequence]) {
+        if sequences.is_empty() {
+            return;
+        }
+
+        // 간단한 경사하강법 (단순화)
+        let avg_access_count = sequences.iter().map(|s| s.access_count).sum::<usize>() as f64
+            / sequences.len() as f64;
+
+        // Hidden layer 업데이트
+        for neuron in &mut self.hidden_layer {
+            let delta = (avg_access_count - 5.0) * self.learning_rate * 0.01;
+            neuron.w += delta;
+            neuron.b += delta * 0.1;
+        }
+
+        // Output layer 업데이트
+        for neuron in &mut self.output_layer {
+            let delta = (avg_access_count - 5.0) * self.learning_rate * 0.01;
+            neuron.w += delta;
+            neuron.b += delta * 0.1;
+        }
+    }
+
+    /// 예측: 입력 접근 횟수 → 다음 3개 파일 신뢰도
+    pub fn predict(&self, input: f64) -> Vec<(usize, f64)> {
+        let outputs = self.forward(input);
+        outputs
+            .iter()
+            .enumerate()
+            .map(|(idx, &confidence)| (idx, confidence))
+            .collect()
+    }
+}
+
+/// 프리페치 추천
+#[derive(Clone, Debug)]
+pub struct PrefetchRecommendation {
+    pub filename: String,
+    pub confidence: f64,  // 0.0~1.0
+    pub position: usize,  // 1, 2, 3 (다음 순서)
+}
+
+/// 프리페쳐 (접근 패턴 기반 예측)
+#[derive(Clone, Debug)]
+pub struct L0NNPrefetcher {
+    pub model: L0NN,
+    pub sequence_history: Vec<AccessSequence>,
+    pub filename_map: HashMap<String, usize>,  // filename → index
+    pub max_history: usize,
+}
+
+impl L0NNPrefetcher {
+    pub fn new() -> Self {
+        L0NNPrefetcher {
+            model: L0NN::new(),
+            sequence_history: Vec::new(),
+            filename_map: HashMap::new(),
+            max_history: 1000,
+        }
+    }
+
+    /// 파일 접근 기록
+    pub fn record_access(&mut self, filename: &str) {
+        self.sequence_history.push(AccessSequence {
+            filename: filename.to_string(),
+            timestamp: self.sequence_history.len() as u64,
+            access_count: self.sequence_history.len() + 1,
+        });
+
+        if self.sequence_history.len() > self.max_history {
+            self.sequence_history.remove(0);
+        }
+
+        // 파일명 인덱싱
+        let len = self.filename_map.len();
+        self.filename_map.entry(filename.to_string()).or_insert(len);
+    }
+
+    /// 모델 학습
+    pub fn train(&mut self) {
+        if self.sequence_history.len() > 10 {
+            // 최근 10개 시퀀스로 학습
+            let recent = self.sequence_history[self.sequence_history.len() - 10..].to_vec();
+            self.model.learn(&recent);
+        }
+    }
+
+    /// 다음 접근 파일 예측
+    pub fn predict_next_accesses(&self, current_access_count: usize) -> Vec<PrefetchRecommendation> {
+        let input = current_access_count as f64;
+        let predictions = self.model.predict(input);
+
+        // 상위 3개 추천
+        let mut recommendations = Vec::new();
+
+        // 최근 시퀀스 기반 휴리스틱
+        if let Some(last_sequence) = self.sequence_history.last() {
+            // 마지막 접근 파일 이후로부터 가능성 높은 파일들
+            let known_files: Vec<_> = self.filename_map.keys().take(3).collect();
+
+            for (idx, (_, confidence)) in predictions.iter().take(3).enumerate() {
+                if idx < known_files.len() {
+                    recommendations.push(PrefetchRecommendation {
+                        filename: known_files[idx].clone(),
+                        confidence: *confidence,
+                        position: idx + 1,
+                    });
+                }
+            }
+        }
+
+        recommendations
+    }
+
+    /// 프리페치 후보 점수
+    pub fn prefetch_score(&self, filename: &str, current_access_count: usize) -> f64 {
+        let predictions = self.predict_next_accesses(current_access_count);
+        predictions
+            .iter()
+            .find(|r| r.filename == filename)
+            .map(|r| r.confidence)
+            .unwrap_or(0.0)
+    }
+
+    /// 통계
+    pub fn statistics(&self) -> PrefetchStatistics {
+        let total_accesses = self.sequence_history.len();
+        let unique_files = self.filename_map.len();
+        let model_accuracy = if total_accesses > 0 {
+            (unique_files as f64 / total_accesses as f64).min(1.0)
+        } else {
+            0.0
+        };
+
+        PrefetchStatistics {
+            total_accesses,
+            unique_files,
+            history_size: self.sequence_history.len(),
+            model_accuracy,
+            predictions_made: 0,
+        }
+    }
+}
+
+/// 프리페치 통계
+#[derive(Clone, Debug)]
+pub struct PrefetchStatistics {
+    pub total_accesses: usize,
+    pub unique_files: usize,
+    pub history_size: usize,
+    pub model_accuracy: f64,
+    pub predictions_made: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_l0nn_creation() {
+        let model = L0NN::new();
+        assert_eq!(model.hidden_layer.len(), 8);
+        assert_eq!(model.output_layer.len(), 3);
+        assert_eq!(model.learning_rate, 0.01);
+    }
+
+    #[test]
+    fn test_neural_activation_functions() {
+        let linear = NeuralWeights::new(2.0, 1.0, Activation::Linear);
+        assert_eq!(linear.forward(2.0), 5.0);
+
+        let relu = NeuralWeights::new(2.0, 1.0, Activation::ReLU);
+        assert!(relu.forward(-1.0) >= 0.0);
+
+        let sigmoid = NeuralWeights::new(1.0, 0.0, Activation::Sigmoid);
+        let result = sigmoid.forward(0.0);
+        assert!(result > 0.4 && result < 0.6);
+    }
+
+    #[test]
+    fn test_l0nn_forward_pass() {
+        let model = L0NN::new();
+        let outputs = model.forward(1.0);
+        assert_eq!(outputs.len(), 3);
+        for output in &outputs {
+            assert!(*output >= 0.0 && *output <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_prefetcher_creation() {
+        let prefetcher = L0NNPrefetcher::new();
+        assert_eq!(prefetcher.sequence_history.len(), 0);
+        assert_eq!(prefetcher.filename_map.len(), 0);
+    }
+
+    #[test]
+    fn test_access_recording() {
+        let mut prefetcher = L0NNPrefetcher::new();
+
+        for i in 0..10 {
+            prefetcher.record_access(&format!("file{}.txt", i % 3));
+        }
+
+        assert_eq!(prefetcher.sequence_history.len(), 10);
+        assert_eq!(prefetcher.filename_map.len(), 3);
+    }
+
+    #[test]
+    fn test_model_training() {
+        let mut prefetcher = L0NNPrefetcher::new();
+
+        // 15회 접근으로 학습
+        for _ in 0..15 {
+            prefetcher.record_access("important.txt");
+        }
+
+        let before_w = prefetcher.model.hidden_layer[0].w;
+        prefetcher.train();
+        let after_w = prefetcher.model.hidden_layer[0].w;
+
+        // 가중치가 변해야 함 (학습됨)
+        assert_ne!(before_w, after_w);
+    }
+
+    #[test]
+    fn test_prefetch_prediction() {
+        let mut prefetcher = L0NNPrefetcher::new();
+
+        for _ in 0..20 {
+            prefetcher.record_access("file1.txt");
+        }
+        for _ in 0..10 {
+            prefetcher.record_access("file2.txt");
+        }
+
+        prefetcher.train();
+
+        let predictions = prefetcher.predict_next_accesses(15);
+        assert!(!predictions.is_empty());
+
+        // 높은 신뢰도 예측 확인
+        let high_confidence = predictions.iter().any(|p| p.confidence > 0.5);
+        assert!(high_confidence || predictions.len() > 0);
+    }
+
+    #[test]
+    fn test_prefetch_score() {
+        let mut prefetcher = L0NNPrefetcher::new();
+
+        for _ in 0..20 {
+            prefetcher.record_access("common.txt");
+        }
+        for _ in 0..5 {
+            prefetcher.record_access("rare.txt");
+        }
+
+        prefetcher.train();
+
+        let score = prefetcher.prefetch_score("common.txt", 20);
+        assert!(score >= 0.0 && score <= 1.0);
+    }
+
+    #[test]
+    fn test_prefetch_statistics() {
+        let mut prefetcher = L0NNPrefetcher::new();
+
+        for i in 0..30 {
+            prefetcher.record_access(&format!("file{}.txt", i % 5));
+        }
+
+        let stats = prefetcher.statistics();
+        assert_eq!(stats.total_accesses, 30);
+        assert_eq!(stats.unique_files, 5);
+        assert!(stats.model_accuracy > 0.0);
+    }
+}

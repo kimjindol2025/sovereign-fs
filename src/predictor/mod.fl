@@ -1,15 +1,20 @@
-// Phase 4: Predictive Prefetching with L0NN
-// L0NN 신경망 기반 예측 프리페칭 (향후 구현)
+// Phase 4: Predictive Prefetching Module
 
-// 계획:
-// - L0NN (Lightweight Neural Network) Integration
-// - Workload Pattern Recognition
-// - Predictive Access Pattern Learning
+pub mod l0nn_prefetcher;
+
+pub use l0nn_prefetcher::{
+    L0NN, NeuralWeights, Activation, AccessSequence,
+    L0NNPrefetcher, PrefetchRecommendation, PrefetchStatistics,
+};
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn test_phase_4_placeholder() {
-        // Phase 4 구현 예정
+    fn test_predictor_module_exports() {
+        let prefetcher = L0NNPrefetcher::new();
+        let stats = prefetcher.statistics();
+        assert_eq!(stats.total_accesses, 0);
     }
 }
